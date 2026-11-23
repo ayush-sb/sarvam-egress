@@ -1,0 +1,241 @@
+diff --git a/lib/llm/src/http/service/metrics.rs b/lib/llm/src/http/service/metrics.rs
+index 825f5db..cc53050 100644
+--- a/lib/llm/src/http/service/metrics.rs
++++ b/lib/llm/src/http/service/metrics.rs
+@@ -806,6 +806,10 @@ pub struct ResponseMetricCollector {
+     last_response_time: Option<Duration>,
+     osl: usize,
+     isl: usize,
++    // The request span current when the collector was created (inside the request handler).
++    // The summary is recorded on it, so the result does not depend on where the response stream
++    // is dropped. DYN_HTTP_TRACE_LITE drops the stream outside the span.
++    request_span: tracing::Span,
+     ttft_ms: Option<f64>,
+     itl_sum_secs: f64,
+     itl_count: u64,
+@@ -1965,6 +1969,7 @@ impl ResponseMetricCollector {
+             is_first_token: true,
+             last_response_time: None,
+             start_time: Instant::now(),
++            request_span: tracing::Span::current(),
+             osl: 0,
+             isl: 0,
+             ttft_ms: None,
+@@ -2268,7 +2273,11 @@ impl Drop for ResponseMetricCollector {
+ 
+         // Record request summary on the enclosing span.
+         // InflightGuard::Drop and on_response logs will inherit these.
+-        let span = tracing::Span::current();
++        let span = if self.request_span.is_none() {
++            tracing::Span::current()
++        } else {
++            self.request_span.clone()
++        };
+         span.record("input_tokens", self.isl as u32);
+         span.record("output_tokens", self.osl as u32);
+         // Only record once observed, so requests that never carried a metrics
+diff --git a/lib/llm/src/http/service/service_v2.rs b/lib/llm/src/http/service/service_v2.rs
+index 874e132..a23a386 100644
+--- a/lib/llm/src/http/service/service_v2.rs
++++ b/lib/llm/src/http/service/service_v2.rs
+@@ -69,6 +69,66 @@ async fn echo_request_id_header(
+     response
+ }
+ 
++/// `TraceLayer` replacement for inference routes (benchmark experiment, DYN_HTTP_TRACE_LITE=1).
++///
++/// Same span, same handler instrumentation and same "http response sent" log as the
++/// `TraceLayer` it replaces. The difference: `TraceLayer` enters the span on every body poll,
++/// which for streaming responses is once per SSE event. Here the body only holds the span, so it
++/// lives until the stream ends, and enters it once while the stream is dropped. Logs emitted
++/// while the body streams are not inside the request span.
++async fn trace_inference_request_lite(
++    request: axum::extract::Request,
++    next: axum::middleware::Next,
++) -> axum::response::Response {
++    use tracing::Instrument;
++    let span = make_inference_request_span(&request);
++    let start = std::time::Instant::now();
++    let response = next.run(request).instrument(span.clone()).await;
++    span.in_scope(|| {
++        let status = response.status();
++        let latency_ms = start.elapsed().as_millis();
++        if status.is_server_error() || status.is_client_error() {
++            tracing::error!(status = %status.as_u16(), latency_ms = %latency_ms, "http response sent");
++        } else {
++            tracing::info!(status = %status.as_u16(), latency_ms = %latency_ms, "http response sent");
++        }
++    });
++    let (parts, body) = response.into_parts();
++    let body = Body::from_stream(SpanHeldStream {
++        inner: Some(body.into_data_stream()),
++        span,
++    });
++    axum::response::Response::from_parts(parts, body)
++}
++
++/// Keeps a span alive for as long as the wrapped stream without entering it per item.
++struct SpanHeldStream<S> {
++    inner: Option<S>,
++    span: tracing::Span,
++}
++
++impl<S: futures::Stream + Unpin> futures::Stream for SpanHeldStream<S> {
++    type Item = S::Item;
++
++    fn poll_next(
++        mut self: std::pin::Pin<&mut Self>,
++        cx: &mut std::task::Context<'_>,
++    ) -> std::task::Poll<Option<S::Item>> {
++        match self.inner.as_mut() {
++            Some(inner) => std::pin::Pin::new(inner).poll_next(cx),
++            None => std::task::Poll::Ready(None),
++        }
++    }
++}
++
++impl<S> Drop for SpanHeldStream<S> {
++    fn drop(&mut self) {
++        // Guards dropped with the stream (inflight, metrics) log inside the request span.
++        let _entered = self.span.enter();
++        drop(self.inner.take());
++    }
++}
++
+ /// State used to select the error format for unmatched routes.
+ #[derive(Clone)]
+ struct UnmatchedRouteState {
+@@ -1506,11 +1566,16 @@ impl HttpServiceConfigBuilder {
+             append_route_docs(&mut all_docs, &mut seen_route_docs, route_docs)?;
+             inference_router = inference_router.merge(route);
+         }
+-        inference_router = inference_router.layer(
+-            TraceLayer::new_for_http()
+-                .make_span_with(make_inference_request_span)
+-                .on_response(on_response),
+-        );
++        inference_router = if env_is_truthy("DYN_HTTP_TRACE_LITE") {
++            tracing::info!("Inference request spans are not entered per body chunk (DYN_HTTP_TRACE_LITE)");
++            inference_router.layer(axum::middleware::from_fn(trace_inference_request_lite))
++        } else {
++            inference_router.layer(
++                TraceLayer::new_for_http()
++                    .make_span_with(make_inference_request_span)
++                    .on_response(on_response),
++            )
++        };
+         inference_router = inference_router.layer(axum::middleware::from_fn_with_state(
+             state.clone(),
+             track_inflight_inference,
+diff --git a/lib/runtime/src/config.rs b/lib/runtime/src/config.rs
+index 3983e9b..55e7cc3 100644
+--- a/lib/runtime/src/config.rs
++++ b/lib/runtime/src/config.rs
+@@ -473,11 +473,11 @@ impl RuntimeConfig {
+     /// they cannot drift apart.
+     pub fn tokio_builder(&self) -> tokio::runtime::Builder {
+         let mut builder = tokio::runtime::Builder::new_multi_thread();
++        let worker_threads = self
++            .num_worker_threads
++            .unwrap_or_else(|| std::thread::available_parallelism().unwrap().get());
+         builder
+-            .worker_threads(
+-                self.num_worker_threads
+-                    .unwrap_or_else(|| std::thread::available_parallelism().unwrap().get()),
+-            )
++            .worker_threads(worker_threads)
+             .max_blocking_threads(self.max_blocking_threads)
+             .enable_all();
+         if env_is_truthy(environment_names::runtime::DYN_ENABLE_POLL_HISTOGRAM) {
+@@ -487,6 +487,7 @@ impl RuntimeConfig {
+             );
+             builder.enable_metrics_poll_time_histogram();
+         }
++        apply_scheduler_experiments(&mut builder, worker_threads);
+         builder
+     }
+ 
+@@ -496,6 +497,83 @@ impl RuntimeConfig {
+     }
+ }
+ 
++/// Benchmark experiments for the Tokio scheduler. Each one is off unless its variable is set.
++///
++/// - `DYN_RUNTIME_PIN_WORKERS=1`: pin worker thread i to the i-th CPU of the process affinity
++///   mask. Blocking-pool threads keep the whole mask.
++/// - `DYN_RUNTIME_EVENT_INTERVAL=N`: scheduler ticks between I/O driver polls (Tokio default 61).
++/// - `DYN_RUNTIME_GLOBAL_QUEUE_INTERVAL=N`: ticks between global queue checks.
++/// - `DYN_RUNTIME_DISABLE_LIFO_SLOT=1`: a woken task goes to the back of the local queue.
++fn apply_scheduler_experiments(builder: &mut tokio::runtime::Builder, worker_threads: usize) {
++    fn env_u32(name: &str) -> Option<u32> {
++        std::env::var(name).ok()?.trim().parse().ok().filter(|value| *value > 0)
++    }
++    if let Some(interval) = env_u32("DYN_RUNTIME_EVENT_INTERVAL") {
++        tracing::info!(interval, "Tokio event interval set (DYN_RUNTIME_EVENT_INTERVAL)");
++        builder.event_interval(interval);
++    }
++    if let Some(interval) = env_u32("DYN_RUNTIME_GLOBAL_QUEUE_INTERVAL") {
++        tracing::info!(
++            interval,
++            "Tokio global queue interval set (DYN_RUNTIME_GLOBAL_QUEUE_INTERVAL)"
++        );
++        builder.global_queue_interval(interval);
++    }
++    if env_is_truthy("DYN_RUNTIME_DISABLE_LIFO_SLOT") {
++        tracing::info!("Tokio LIFO slot disabled (DYN_RUNTIME_DISABLE_LIFO_SLOT)");
++        builder.disable_lifo_slot();
++    }
++    #[cfg(target_os = "linux")]
++    if env_is_truthy("DYN_RUNTIME_PIN_WORKERS") {
++        let cpus = worker_affinity::allowed_cpus();
++        if cpus.is_empty() {
++            tracing::warn!("DYN_RUNTIME_PIN_WORKERS set but the affinity mask is unreadable");
++        } else {
++            tracing::info!(?cpus, worker_threads, "Pinning Tokio workers (DYN_RUNTIME_PIN_WORKERS)");
++            // The runtime starts its workers first, so the first `worker_threads` thread starts
++            // of this builder are the workers. Later starts are blocking-pool threads.
++            let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
++            builder.on_thread_start(move || {
++                let index = started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                if index < worker_threads {
++                    worker_affinity::pin_current_thread(cpus[index % cpus.len()]);
++                }
++            });
++        }
++    }
++}
++
++#[cfg(target_os = "linux")]
++mod worker_affinity {
++    /// CPUs in this process's affinity mask, in ascending order.
++    pub(super) fn allowed_cpus() -> Vec<usize> {
++        // SAFETY: `set` is a plain bit set that the kernel fills; its size is passed exactly.
++        unsafe {
++            let mut set: libc::cpu_set_t = std::mem::zeroed();
++            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
++                return Vec::new();
++            }
++            (0..libc::CPU_SETSIZE as usize)
++                .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
++                .collect()
++        }
++    }
++
++    /// Restrict the calling thread to one CPU.
++    pub(super) fn pin_current_thread(cpu: usize) {
++        // SAFETY: as above; pid 0 is the calling thread.
++        let result = unsafe {
++            let mut set: libc::cpu_set_t = std::mem::zeroed();
++            libc::CPU_ZERO(&mut set);
++            libc::CPU_SET(cpu, &mut set);
++            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
++        };
++        if result != 0 {
++            tracing::warn!(cpu, error = %std::io::Error::last_os_error(), "Could not pin a Tokio worker");
++        }
++    }
++}
++
+ impl Default for RuntimeConfig {
+     fn default() -> Self {
+         let num_cores = std::thread::available_parallelism().unwrap().get();

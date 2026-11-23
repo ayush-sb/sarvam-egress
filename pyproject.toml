@@ -1,0 +1,26 @@
+# Python environment for the egress benchmark harness.
+# Every direct dependency is pinned exactly; uv.lock pins everything transitive.
+# Do not bump anything here mid-project without updating PINS.md.
+
+[project]
+name = "sarvam-egress"
+version = "0.1.0"
+# Exact interpreter (3.12.12) is pinned in .python-version and checked by scripts/check-pins.sh.
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Dynamo under test, built from the pinned submodule (v1.6.2 @ 28f9765d).
+    "ai-dynamo==1.6.2",
+    "ai-dynamo-runtime==1.6.2",
+    # Build backend for the Rust bindings.
+    "maturin==1.16.0",
+    "patchelf==0.19.3.0",
+    # Load generator; version from the Dynamo v1.6.2 release notes.
+    "aiperf==0.13.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+ai-dynamo = { path = "dynamo", editable = true }
+ai-dynamo-runtime = { path = "dynamo/lib/bindings/python", editable = true }

@@ -1,0 +1,57 @@
+--- a/sglang/srt/managers/scheduler_components/output_streamer.py
++++ b/sglang/srt/managers/scheduler_components/output_streamer.py
+@@ -149,6 +149,10 @@
+         skip_req: Optional[Req] = None,
+         is_idle_batch: bool = False,
+     ):
++        import os
++        import time
++
++        emit_ns = time.time_ns() if os.environ.get("SARVAM_STEP_TRACE") == "1" else None
+         return_hidden_states = any(
+             req.return_hidden_states for req in reqs if req is not skip_req
+         )
+@@ -203,6 +207,12 @@
+                         f"for {len(acc.output_reqs)} requests"
+                     )
+                 acc.customized_info[key] = values
++
++        # Record one host timestamp for all token IDs released by this scheduler batch.
++        if emit_ns is not None:
++            acc.customized_info["sarvam_emit_ns"] = [
++                [emit_ns] * len(ids) for ids in acc.output_ids
++            ]
+ 
+         # Send to detokenizer
+         payload = acc.to_payload(
+--- a/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -2071,6 +2071,9 @@
+                     reasoning_tokens=reasoning_tokens,
+                     completion_tokens=completion_tokens,
+                 ):
++                    stamps = content["meta_info"].get("sarvam_emit_ns", [])
++                    if stamps and all(stamps) and chunk.startswith("data: {"):
++                        chunk = chunk.removesuffix("\n\n") + "\n: step=" + ",".join(map(str, stamps)) + "\n\n"
+                     yield chunk
+ 
+             # Send finish_reason chunks for each index that completed
+--- a/sglang/benchmark/serving.py
++++ b/sglang/benchmark/serving.py
+@@ -530,7 +530,7 @@
+                         # Streaming response
+                         async for chunk_bytes in response.content:
+                             chunk_bytes = chunk_bytes.strip()
+-                            if not chunk_bytes:
++                            if not chunk_bytes.startswith(b"data:"):
+                                 continue
+ 
+                             chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+@@ -1929,6 +1929,7 @@
+     result_details = {
+         "input_lens": [output.prompt_len for output in outputs],
+         "output_lens": output_lens,
++        "start_times": [output.start_time for output in outputs],
+         "ttfts": [output.ttft for output in outputs],
+         "itls": [output.itl for output in outputs],
+         "generated_texts": [output.generated_text for output in outputs],

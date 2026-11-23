@@ -1,0 +1,92 @@
+diff --git a/lib/llm/src/preprocessor.rs b/lib/llm/src/preprocessor.rs
+index 80ed3a3..3617c2b 100644
+--- a/lib/llm/src/preprocessor.rs
++++ b/lib/llm/src/preprocessor.rs
+@@ -5513,6 +5513,24 @@ impl OpenAIPreprocessor {
+         })
+     }
+ 
++    fn can_skip_plain_chat_postprocessing(
++        &self,
++        request: &NvCreateChatCompletionRequest,
++        route: &ToolProcessingRoute,
++        constraint: &crate::protocols::openai::GuidedToolConstraint,
++    ) -> bool {
++        matches!(route, ToolProcessingRoute::PassThrough)
++            && matches!(constraint, crate::protocols::openai::GuidedToolConstraint::None)
++            && request.inner.n.unwrap_or(1) == 1
++            && self.tool_call_parser.is_none()
++            && self.runtime_config.reasoning_parser.is_none()
++            && request.inner.response_format.is_none()
++            && request.nvext.is_none()
++            && !Self::wants_reasoning_as_content_when_empty(request.chat_template_args.as_ref())
++            && crate::preprocessor::tool_choice::effective_tools(&request.inner)
++                .is_ok_and(|tools| tools.is_empty())
++    }
++
+     pub fn transform_postprocessor_stream<S, Resp>(
+         stream: S,
+         generator: Box<dyn DeltaGeneratorExt<Resp>>,
+@@ -7748,14 +7766,36 @@ impl
+             image_tokens,
+         );
+ 
+-        let transformed_stream = self.postprocessor_parsing_stream_with_constraint(
+-            stream,
+-            &request,
+-            prompt_injected_reasoning,
+-            guided_tool_constraint,
+-            tool_processing_route,
+-        )?;
+-        let transformed_stream = Self::normalize_chat_stream_roles(transformed_stream);
++        static SKIP_PLAIN_CHAT_POSTPROCESSING: std::sync::OnceLock<bool> =
++            std::sync::OnceLock::new();
++        let skip_plain_postprocessing = *SKIP_PLAIN_CHAT_POSTPROCESSING.get_or_init(|| {
++            dynamo_runtime::config::env_is_truthy("DYN_SKIP_PLAIN_CHAT_POSTPROCESSING")
++        }) && original_stream_flag
++            && payload_handle.is_none()
++            && mm_counts.image == 0
++            && mm_counts.video == 0
++            && mm_counts.audio == 0
++            && self.can_skip_plain_chat_postprocessing(
++                &request,
++                &tool_processing_route,
++                &guided_tool_constraint,
++            );
++        let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> =
++            if skip_plain_postprocessing {
++                // With no parser, the generator's role-bearing delta cannot be
++                // held back, and the generator never emits a structured tool call.
++                tracing::debug!("Skipping plain chat parser and role wrappers");
++                Box::pin(stream)
++            } else {
++                let parsed = self.postprocessor_parsing_stream_with_constraint(
++                    stream,
++                    &request,
++                    prompt_injected_reasoning,
++                    guided_tool_constraint,
++                    tool_processing_route,
++                )?;
++                Box::pin(Self::normalize_chat_stream_roles(parsed))
++            };
+ 
+         // Request payload capture is a pass-through: every chunk reaches the HTTP
+         // layer unchanged (metrics, errors, aggregation all behave as with capture
+@@ -7765,7 +7805,7 @@ impl
+                 .expect("payload capture has matching request parsing options");
+             let (stream, agg_fut) =
+                 crate::request_trace::payload_stream::scan_aggregate_with_future(
+-                    Box::pin(transformed_stream),
++                    transformed_stream,
+                     parsing_options,
+                 );
+ 
+@@ -7786,7 +7826,7 @@ impl
+ 
+             stream
+         } else {
+-            Box::pin(transformed_stream)
++            transformed_stream
+         };
+ 
+         // Step 5: Speculative next-turn prefill

@@ -1,0 +1,8 @@
+{
+  "source_revision": "745745a",
+  "source_sha256": "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4",
+  "tokenizer_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+  "max_input_tokens": 128,
+  "prompts": 10000,
+  "sha256": "0cd2955dd409fe3cbd2bf30bbca16525d02393ed263c7c63aa37d1da80bcd970"
+}

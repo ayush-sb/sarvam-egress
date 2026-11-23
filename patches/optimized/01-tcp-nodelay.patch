@@ -1,0 +1,21 @@
+diff --git a/lib/llm/src/http/service/service_v2.rs b/lib/llm/src/http/service/service_v2.rs
+index 3ed7c99..20c7e87 100644
+--- a/lib/llm/src/http/service/service_v2.rs
++++ b/lib/llm/src/http/service/service_v2.rs
+@@ -1070,6 +1070,16 @@ impl HttpService {
+             tokio::spawn(tokio_metrics_and_canary_loop(cancel_token.clone()));
+ 
+             let state = self.state.clone();
++            // DYN_HTTP_TCP_NODELAY=1 sets TCP_NODELAY on every accepted client connection.
++            let tcp_nodelay = matches!(
++                std::env::var("DYN_HTTP_TCP_NODELAY").as_deref(),
++                Ok("1") | Ok("true") | Ok("on")
++            );
++            let listener = axum::serve::ListenerExt::tap_io(listener, move |stream| {
++                if tcp_nodelay && let Err(e) = stream.set_nodelay(true) {
++                    tracing::warn!("failed to set TCP_NODELAY on client connection: {e}");
++                }
++            });
+             axum::serve(listener, router)
+                 .with_graceful_shutdown(async move {
+                     observer.cancelled_owned().await;

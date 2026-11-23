@@ -1,0 +1,49 @@
+diff --git a/components/src/dynamo/sglang/request_handlers/llm/decode_handler.py b/components/src/dynamo/sglang/request_handlers/llm/decode_handler.py
+index f300dec..acba9c8 100644
+--- a/components/src/dynamo/sglang/request_handlers/llm/decode_handler.py
++++ b/components/src/dynamo/sglang/request_handlers/llm/decode_handler.py
+@@ -3,6 +3,7 @@
+ 
+ import asyncio
+ import logging
++import os
+ import time
+ from typing import Any, AsyncGenerator, AsyncIterator, Dict, Mapping, Optional
+ 
+@@ -12,6 +13,8 @@ import torch
+ from PIL.Image import Image as PILImage
+ from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+ 
++_BENCH_EMIT_TS = bool(os.environ.get("DYN_BENCH_EMIT_TS"))
++
+ from dynamo._core import Context
+ from dynamo.common.backend import logprobs as _shared_logprobs
+ from dynamo.common.constants import DisaggregationMode
+@@ -792,6 +795,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
+                         sampling_params
+                     ),
+                 ):
++                    if _BENCH_EMIT_TS:
++                        # Benchmark only: stamp each frame with CLOCK_REALTIME ns as an envelope comment.
++                        out = {
++                            "_dynamo_annotated": True,
++                            "data": out,
++                            "comment": [f"t={time.time_ns()}"],
++                        }
+                     yield out
+             else:
+                 async for out in self._process_text_stream(
+@@ -892,6 +902,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
+                         sampling_params
+                     ),
+                 ):
++                    if _BENCH_EMIT_TS:
++                        # Benchmark only: stamp each frame with CLOCK_REALTIME ns as an envelope comment.
++                        out = {
++                            "_dynamo_annotated": True,
++                            "data": out,
++                            "comment": [f"t={time.time_ns()}"],
++                        }
+                     yield out
+             else:
+                 async for out in self._process_text_stream(

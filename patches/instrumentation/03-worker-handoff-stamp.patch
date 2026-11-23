@@ -1,0 +1,12 @@
+--- a/components/src/dynamo/sglang/request_handlers/llm/decode_handler.py
++++ b/components/src/dynamo/sglang/request_handlers/llm/decode_handler.py
+@@ -1149,7 +1149,8 @@
+                         out = {
+                             "_dynamo_annotated": True,
+                             "data": out,
+-                            "comment": ["step=" + ",".join(map(str, stamps))],
++                            # handoff: when this frame leaves the Python relay for Dynamo's Rust sender
++                            "comment": ["step=" + ",".join(map(str, stamps)), f"handoff={time.time_ns()}"],
+                         }
+                     yield out
+ 

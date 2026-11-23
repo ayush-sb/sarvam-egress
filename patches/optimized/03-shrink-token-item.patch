@@ -1,0 +1,771 @@
+diff --git a/lib/backend-common/src/adapter.rs b/lib/backend-common/src/adapter.rs
+index 0aed2b6..89996c1 100644
+--- a/lib/backend-common/src/adapter.rs
++++ b/lib/backend-common/src/adapter.rs
+@@ -420,7 +420,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
+                                 notifier.notify();
+                             }
+                             if let Some(link) = &worker_trace_link {
+-                                chunk.worker_trace_link = Some(link.clone());
++                                chunk.worker_trace_link = Some(Box::new(link.clone()));
+                             }
+                             signalled = true;
+                         } else if should_record_attrs
+@@ -456,7 +456,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
+                             && chunk.worker_trace_link.is_none()
+                             && let Some(link) = &worker_trace_link
+                         {
+-                            chunk.worker_trace_link = Some(link.clone());
++                            chunk.worker_trace_link = Some(Box::new(link.clone()));
+                         }
+                         yield Annotated::from_data(chunk);
+                         if is_terminal {
+diff --git a/lib/backend-common/src/engine.rs b/lib/backend-common/src/engine.rs
+index 2c5daf1..e517fa3 100644
+--- a/lib/backend-common/src/engine.rs
++++ b/lib/backend-common/src/engine.rs
+@@ -649,7 +649,7 @@ impl LLMEngineOutputExt for LLMEngineOutput {
+         self
+     }
+     fn with_usage(mut self, usage: CompletionUsage) -> Self {
+-        self.completion_usage = Some(usage);
++        self.completion_usage = Some(Box::new(usage));
+         self
+     }
+     fn with_encoder_result(
+diff --git a/lib/llm/src/http/service/generate.rs b/lib/llm/src/http/service/generate.rs
+index 9cea2e0..1f0b0ae 100644
+--- a/lib/llm/src/http/service/generate.rs
++++ b/lib/llm/src/http/service/generate.rs
+@@ -1439,7 +1439,7 @@ pub(crate) mod tests {
+                     token_ids: vec![11],
+                     index: Some(0),
+                     finish_reason: Some(crate::protocols::common::FinishReason::Stop),
+-                    completion_usage: Some(dynamo_protocols::types::CompletionUsage {
++                    completion_usage: Some(Box::new(dynamo_protocols::types::CompletionUsage {
+                         prompt_tokens: 3,
+                         completion_tokens: 2,
+                         total_tokens: 5,
+@@ -1449,7 +1449,7 @@ pub(crate) mod tests {
+                             ..Default::default()
+                         }),
+                         completion_tokens_details: None,
+-                    }),
++                    })),
+                     ..Default::default()
+                 })
+             });
+@@ -1493,7 +1493,7 @@ pub(crate) mod tests {
+                             token_ids: vec![11],
+                             index: Some(0),
+                             finish_reason: Some(crate::protocols::common::FinishReason::Stop),
+-                            completion_usage: Some(dynamo_protocols::types::CompletionUsage {
++                            completion_usage: Some(Box::new(dynamo_protocols::types::CompletionUsage {
+                                 prompt_tokens,
+                                 completion_tokens: 1,
+                                 total_tokens: prompt_tokens + 1,
+@@ -1505,7 +1505,7 @@ pub(crate) mod tests {
+                                     },
+                                 ),
+                                 completion_tokens_details: None,
+-                            }),
++                            })),
+                             ..Default::default()
+                         },
+                     )]))
+@@ -3170,7 +3170,7 @@ pub(crate) mod tests {
+         let mut first = Annotated::from_data(LLMEngineOutput {
+             token_ids: vec![10],
+             index: Some(0),
+-            routing_data: Some(crate::protocols::common::timing::RoutingData {
++            routing_data: Some(Box::new(crate::protocols::common::timing::RoutingData {
+                 worker_id: Some(crate::protocols::common::extensions::WorkerIdInfo {
+                     prefill_worker_id: Some(8_765_432_101),
+                     prefill_dp_rank: Some(4),
+@@ -3178,7 +3178,7 @@ pub(crate) mod tests {
+                     decode_dp_rank: Some(5),
+                 }),
+                 ..Default::default()
+-            }),
++            })),
+             ..Default::default()
+         });
+         collector.observe(&mut first);
+diff --git a/lib/llm/src/http/service/metrics.rs b/lib/llm/src/http/service/metrics.rs
+index 7a86b9e..825f5db 100644
+--- a/lib/llm/src/http/service/metrics.rs
++++ b/lib/llm/src/http/service/metrics.rs
+@@ -3256,12 +3256,12 @@ mod tests {
+             },
+             nvext: None,
+             prompt_logprobs: None,
+-            llm_metrics: Some(LLMMetricAnnotation {
++            llm_metrics: Some(Box::new(LLMMetricAnnotation {
+                 input_tokens: 10,
+                 output_tokens: 4,
+                 chunk_tokens: 4,
+                 ..Default::default()
+-            }),
++            })),
+             tool_call_completion: Vec::new(),
+         };
+         let annotated = crate::types::Annotated::from_data(data);
+@@ -4023,7 +4023,7 @@ mod tests {
+         let expected_tokenizer_metric_name = "dynamo_frontend_tokenizer_latency_ms";
+         let mut collector = metrics.clone().create_response_collector(model);
+         let mut annotated = make_chat_stream_annotated("hello");
+-        annotated.data.as_mut().unwrap().llm_metrics = Some(LLMMetricAnnotation {
++        annotated.data.as_mut().unwrap().llm_metrics = Some(Box::new(LLMMetricAnnotation {
+             input_tokens: 10,
+             output_tokens: 20,
+             chunk_tokens: 5,
+@@ -4038,7 +4038,7 @@ mod tests {
+             detokenize_total_latency: Some(Duration::from_micros(100)),
+             detokenize_count: Some(2),
+             ..Default::default()
+-        });
++        }));
+ 
+         assert!(annotated.event.is_none());
+         assert!(annotated.comment.is_none());
+@@ -4115,7 +4115,7 @@ mod tests {
+ 
+         let without_metrics = make_chat_stream_annotated("hello").data.unwrap();
+         let mut with_metrics = without_metrics.clone();
+-        with_metrics.llm_metrics = Some(LLMMetricAnnotation {
++        with_metrics.llm_metrics = Some(Box::new(LLMMetricAnnotation {
+             input_tokens: 1,
+             output_tokens: 2,
+             chunk_tokens: 1,
+@@ -4131,7 +4131,7 @@ mod tests {
+             detokenize_total_latency: None,
+             detokenize_count: None,
+             ..Default::default()
+-        });
++        }));
+ 
+         let without_json = serde_json::to_value(&without_metrics).unwrap();
+         let with_json = serde_json::to_value(&with_metrics).unwrap();
+@@ -5040,7 +5040,7 @@ mod tests {
+         /// prompt tokens on the final one.
+         fn backend_success() -> Vec<Annotated<BackendOutput>> {
+             let mut last = backend_output("world", vec![2, 3], Some(FinishReason::Stop));
+-            last.completion_usage = Some(dynamo_protocols::types::CompletionUsage {
++            last.completion_usage = Some(Box::new(dynamo_protocols::types::CompletionUsage {
+                 prompt_tokens: INPUT_TOKENS as u32,
+                 completion_tokens: 3,
+                 total_tokens: (INPUT_TOKENS + 3) as u32,
+@@ -5049,7 +5049,7 @@ mod tests {
+                     ..Default::default()
+                 }),
+                 ..Default::default()
+-            });
++            }));
+             vec![
+                 Annotated::from_data(backend_output("Hello ", vec![1], None)),
+                 Annotated::from_data(last),
+@@ -5155,7 +5155,7 @@ mod tests {
+                     service_tier: None,
+                 },
+                 nvext: None,
+-                llm_metrics,
++                llm_metrics: llm_metrics.map(Box::new),
+                 prompt_logprobs: None,
+                 tool_call_completion: Vec::new(),
+             };
+@@ -5350,7 +5350,7 @@ mod tests {
+         async fn test_capture_observes_dual_carrier_chunk_once() {
+             let dual_carrier = || {
+                 let mut tail = payload_usage_tail(3);
+-                tail.data.as_mut().unwrap().llm_metrics = Some(chunk_metrics(5, 5));
++                tail.data.as_mut().unwrap().llm_metrics = Some(Box::new(chunk_metrics(5, 5)));
+                 vec![tail]
+             };
+             let (plain_registry, _) =
+diff --git a/lib/llm/src/kv_router/encoder_router.rs b/lib/llm/src/kv_router/encoder_router.rs
+index d657105..220c51f 100644
+--- a/lib/llm/src/kv_router/encoder_router.rs
++++ b/lib/llm/src/kv_router/encoder_router.rs
+@@ -316,7 +316,7 @@ impl EncoderRouter {
+             .encoder_result
+             .filter(serde_json::Value::is_object)
+             .context("Encode worker terminal is missing an object-shaped encoder_result")?;
+-        Ok((result, terminal.worker_trace_link))
++        Ok((result, terminal.worker_trace_link.map(|boxed| *boxed)))
+     }
+ }
+ 
+diff --git a/lib/llm/src/kv_router/prefill_router/admission.rs b/lib/llm/src/kv_router/prefill_router/admission.rs
+index 01186fd..a7e83e1 100644
+--- a/lib/llm/src/kv_router/prefill_router/admission.rs
++++ b/lib/llm/src/kv_router/prefill_router/admission.rs
+@@ -142,7 +142,7 @@ impl PrefillRouter {
+                 disaggregated_params,
+                 prompt_tokens_details,
+             },
+-            worker_link: output.worker_trace_link.clone(),
++            worker_link: output.worker_trace_link.as_deref().cloned(),
+             completion,
+         })
+     }
+diff --git a/lib/llm/src/kv_router/prefill_router/mod.rs b/lib/llm/src/kv_router/prefill_router/mod.rs
+index 2082777..fef057d 100644
+--- a/lib/llm/src/kv_router/prefill_router/mod.rs
++++ b/lib/llm/src/kv_router/prefill_router/mod.rs
+@@ -818,10 +818,10 @@ mod tests {
+             assert!(request.get_annotation_value("query_instance_id").is_some());
+             self.requests.fetch_add(1, Ordering::Relaxed);
+             let output = Annotated::from_data(LLMEngineOutput {
+-                routing_data: Some(RoutingData {
++                routing_data: Some(Box::new(RoutingData {
+                     token_ids: Some(request.token_ids.as_ref().clone()),
+                     ..Default::default()
+-                }),
++                })),
+                 ..Default::default()
+             });
+             Ok(ResponseStream::new(
+diff --git a/lib/llm/src/kv_router/routing_host.rs b/lib/llm/src/kv_router/routing_host.rs
+index b148ab2..b0e7594 100644
+--- a/lib/llm/src/kv_router/routing_host.rs
++++ b/lib/llm/src/kv_router/routing_host.rs
+@@ -877,11 +877,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
+             );
+ 
+             let output = LLMEngineOutput {
+-                routing_data: Some(RoutingData {
++                routing_data: Some(Box::new(RoutingData {
+                     worker_id: worker_id_info,
+                     token_ids: Some(request.token_ids.as_ref().clone()),
+                     ..Default::default()
+-                }),
++                })),
+                 ..Default::default()
+             };
+             let response = Annotated::from_data(output);
+diff --git a/lib/llm/src/kv_router/routing_host/tests.rs b/lib/llm/src/kv_router/routing_host/tests.rs
+index eb3b8b0..85296dc 100644
+--- a/lib/llm/src/kv_router/routing_host/tests.rs
++++ b/lib/llm/src/kv_router/routing_host/tests.rs
+@@ -2281,13 +2281,13 @@ async fn classifier_uses_scheduler_token_basis() {
+         .unwrap();
+     guard.mark_dispatched();
+     let output = LLMEngineOutput {
+-        completion_usage: Some(dynamo_protocols::types::CompletionUsage {
++        completion_usage: Some(Box::new(dynamo_protocols::types::CompletionUsage {
+             prompt_tokens: 5,
+             completion_tokens: 6,
+             total_tokens: 11,
+             prompt_tokens_details: None,
+             completion_tokens_details: None,
+-        }),
++        })),
+         ..Default::default()
+     };
+     guard.on_item(&Annotated::from_data(output)).await;
+diff --git a/lib/llm/src/migration.rs b/lib/llm/src/migration.rs
+index 1ce24e2..8b40ae3 100644
+--- a/lib/llm/src/migration.rs
++++ b/lib/llm/src/migration.rs
+@@ -51,7 +51,7 @@ impl HasTokenIds for BackendOutput {
+         &self.token_ids
+     }
+     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink> {
+-        self.worker_trace_link.as_ref()
++        self.worker_trace_link.as_deref()
+     }
+     fn decoder_checkpoint(&self) -> Option<&DecoderCheckpoint> {
+         self.jailed_text.as_ref()
+@@ -63,7 +63,7 @@ impl HasTokenIds for LLMEngineOutput {
+         &self.token_ids
+     }
+     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink> {
+-        self.worker_trace_link.as_ref()
++        self.worker_trace_link.as_deref()
+     }
+     fn decoder_checkpoint(&self) -> Option<&DecoderCheckpoint> {
+         self.jailed_text.as_ref()
+@@ -277,6 +277,22 @@ where
+             session_affinity,
+         )
+         .await?;
++        // `unfold` moves its state into and out of a future for every item. `RetryManager`
++        // holds the whole request (about 2 KB), so with DYN_MIGRATION_BOX_STATE=1 it is kept
++        // on the heap and only a pointer moves.
++        if migration_box_state() {
++            let response_stream = stream::unfold(
++                Box::new(retry_manager),
++                move |mut retry_manager| async move {
++                    retry_manager
++                        .next()
++                        .await
++                        .map(|response| (response, retry_manager))
++                },
++            )
++            .fuse();
++            return Ok(ResponseStream::new(Box::pin(response_stream), engine_ctx_));
++        }
+         let response_stream = stream::unfold(retry_manager, move |mut retry_manager| async move {
+             retry_manager
+                 .next()
+@@ -288,6 +304,17 @@ where
+     }
+ }
+ 
++/// Whether the migration stream keeps its `RetryManager` boxed (`DYN_MIGRATION_BOX_STATE`).
++fn migration_box_state() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        matches!(
++            std::env::var("DYN_MIGRATION_BOX_STATE").as_deref(),
++            Ok("1") | Ok("true") | Ok("on")
++        )
++    })
++}
++
+ struct MigrationEvent {
+     migration_type: &'static str,
+     started_at: Instant,
+@@ -3069,7 +3096,7 @@ mod tests {
+                         if i == start
+                             && let (Some(link), Some(data)) = (&link, out.data.as_mut())
+                         {
+-                            data.worker_trace_link = Some(link.clone());
++                            data.worker_trace_link = Some(Box::new(link.clone()));
+                         }
+                         if tx.send(out).await.is_err() {
+                             return;
+diff --git a/lib/llm/src/mocker.rs b/lib/llm/src/mocker.rs
+index 73eadec..8d93a1a 100644
+--- a/lib/llm/src/mocker.rs
++++ b/lib/llm/src/mocker.rs
+@@ -1176,7 +1176,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
+                             disaggregated_params: is_prefill.then(|| serde_json::json!("dummy")),
+                             completion_usage: signal.cached_tokens.map(|cached| {
+                                 usage_with_cached_tokens(prompt_tokens_count, token_count, cached)
+-                            }),
++                            }).map(Box::new),
+                             ..Default::default()
+                         };
+ 
+@@ -1265,11 +1265,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
+                                     .expect("native SGLang request has a terminal token");
+                                 output.finish_reason = Some(FinishReason::Length);
+                                 if let Some(cached) = cached_prefix_tokens {
+-                                    output.completion_usage = Some(usage_with_cached_tokens(
++                                    output.completion_usage = Some(Box::new(usage_with_cached_tokens(
+                                         prompt_tokens_count,
+                                         token_count,
+                                         cached,
+-                                    ));
++                                    )));
+                                 }
+                                 if !send_response(&stream_tx, output, &async_context) {
+                                     break;
+@@ -1278,11 +1278,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
+                             } else {
+                                 let mut final_output = LLMEngineOutput::length();
+                                 if let Some(cached) = cached_prefix_tokens {
+-                                    final_output.completion_usage = Some(usage_with_cached_tokens(
++                                    final_output.completion_usage = Some(Box::new(usage_with_cached_tokens(
+                                         prompt_tokens_count,
+                                         token_count,
+                                         cached,
+-                                    ));
++                                    )));
+                                 }
+                                 if !send_response(&stream_tx, final_output, &async_context) {
+                                     break;
+@@ -1529,10 +1529,10 @@ mod tests {
+                     ..Default::default()
+                 }),
+                 completion_tokens_details: None,
+-            })
++            }).map(Box::new)
+         );
+         let mut expected_finish = LLMEngineOutput::length();
+-        expected_finish.completion_usage = Some(usage_with_cached_tokens(3, 1, 0));
++        expected_finish.completion_usage = Some(Box::new(usage_with_cached_tokens(3, 1, 0)));
+         assert_eq!(stream.next().await.unwrap().data.unwrap(), expected_finish);
+         assert!(stream.next().await.is_none());
+     }
+diff --git a/lib/llm/src/preprocessor.rs b/lib/llm/src/preprocessor.rs
+index 30f623f..80ed3a3 100644
+--- a/lib/llm/src/preprocessor.rs
++++ b/lib/llm/src/preprocessor.rs
+@@ -474,7 +474,7 @@ where
+         && let Some(chat_response) =
+             (data as &mut dyn Any).downcast_mut::<NvCreateChatCompletionStreamResponse>()
+     {
+-        chat_response.llm_metrics = Some(metrics);
++        chat_response.llm_metrics = Some(Box::new(metrics));
+         return;
+     }
+ 
+@@ -6085,7 +6085,7 @@ impl OpenAIPreprocessor {
+                     }
+                     if let Some(metrics) = nv.llm_metrics.take() {
+                         p.chunk_tokens = p.chunk_tokens.saturating_add(metrics.chunk_tokens);
+-                        p.metrics_template = Some(metrics);
++                        p.metrics_template = Some(*metrics);
+                     }
+                     merge_response_nvext(&mut p.nvext, nv.nvext.take());
+                     if let Some(prompt_logprobs) = nv.prompt_logprobs.take() {
+@@ -6219,7 +6219,7 @@ impl OpenAIPreprocessor {
+                     inner,
+                     nvext,
+                     prompt_logprobs,
+-                    llm_metrics,
++                    llm_metrics: llm_metrics.map(Box::new),
+                     tool_call_completion: Vec::new(),
+                 }),
+                 id: a.id,
+@@ -6353,7 +6353,7 @@ impl OpenAIPreprocessor {
+                             inner,
+                             nvext,
+                             prompt_logprobs,
+-                            llm_metrics,
++                            llm_metrics: llm_metrics.map(Box::new),
+                             tool_call_completion: Vec::new(),
+                         }),
+                         id: None,
+@@ -10192,10 +10192,10 @@ mod tests {
+         data.inner.choices[0].delta.content = content
+             .map(str::to_string)
+             .map(ChatCompletionMessageContent::Text);
+-        data.llm_metrics = Some(LLMMetricAnnotation {
++        data.llm_metrics = Some(Box::new(LLMMetricAnnotation {
+             chunk_tokens,
+             ..Default::default()
+-        });
++        }));
+         chunk
+     }
+ 
+@@ -10220,10 +10220,10 @@ mod tests {
+                 .reasoning_tokens = Some(reasoning_tokens);
+         }
+         data.inner.usage = Some(usage);
+-        data.llm_metrics = Some(LLMMetricAnnotation {
++        data.llm_metrics = Some(Box::new(LLMMetricAnnotation {
+             output_tokens: completion_tokens as usize,
+             ..Default::default()
+-        });
++        }));
+         chunk
+     }
+ 
+diff --git a/lib/llm/src/protocols/common/llm_backend.rs b/lib/llm/src/protocols/common/llm_backend.rs
+index dc1c442..4324b9b 100644
+--- a/lib/llm/src/protocols/common/llm_backend.rs
++++ b/lib/llm/src/protocols/common/llm_backend.rs
+@@ -159,7 +159,7 @@ pub struct BackendOutput {
+ 
+     // Token usage information
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub completion_usage: Option<CompletionUsage>,
++    pub completion_usage: Option<Box<CompletionUsage>>,
+ 
+     /// Disaggregated execution parameters (for prefill/decode separation).
+     /// Engine-owned payload — backends pack their own KV-transfer format
+@@ -181,7 +181,7 @@ pub struct BackendOutput {
+     /// can record an OTel `Link` on its `engine.generate` span. Engines
+     /// should NOT read or write this field.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub worker_trace_link: Option<crate::protocols::common::preprocessor::TraceLink>,
++    pub worker_trace_link: Option<Box<crate::protocols::common::preprocessor::TraceLink>>,
+ 
+     /// Opaque engine data passed through from the backend worker to the response.
+     /// Dynamo does not inspect this field; it is serialized as-is into `nvext.engine_data`.
+@@ -192,7 +192,7 @@ pub struct BackendOutput {
+     /// a standalone router) so it joins this request's trace/metrics. Dynamo-internal,
+     /// consumed by the frontend and not surfaced to clients. See [`RoutingData`](crate::protocols::common::timing::RoutingData).
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub routing_data: Option<crate::protocols::common::timing::RoutingData>,
++    pub routing_data: Option<Box<crate::protocols::common::timing::RoutingData>>,
+ 
+     /// Frontend-only decoder checkpoint for a possible migration retry. Its serialized
+     /// representation remains the historical optional `jailed_text` string; pending token
+@@ -266,7 +266,7 @@ pub struct LLMEngineOutput {
+     /// prefill terminal chunk; consumed by the decode adapter. Engines
+     /// should NOT read or write this field.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub worker_trace_link: Option<crate::protocols::common::preprocessor::TraceLink>,
++    pub worker_trace_link: Option<Box<crate::protocols::common::preprocessor::TraceLink>>,
+ 
+     /// Additional arguments for extensibility
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+@@ -274,7 +274,7 @@ pub struct LLMEngineOutput {
+ 
+     // Token usage information
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub completion_usage: Option<CompletionUsage>,
++    pub completion_usage: Option<Box<CompletionUsage>>,
+ 
+     /// Opaque engine data passed through from the backend worker to the response.
+     /// Dynamo does not inspect this field; it is serialized as-is into `nvext.engine_data`.
+@@ -284,7 +284,7 @@ pub struct LLMEngineOutput {
+     /// Router-computed data handed back to the frontend (e.g. standalone-router timing).
+     /// Dynamo-internal; consumed by the frontend. See [`RoutingData`](crate::protocols::common::timing::RoutingData).
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub routing_data: Option<crate::protocols::common::timing::RoutingData>,
++    pub routing_data: Option<Box<crate::protocols::common::timing::RoutingData>>,
+ 
+     /// Frontend-only decoder checkpoint for a possible migration retry. Engines never set
+     /// it; `Backend` populates it after worker deserialization. The legacy optional-string
+diff --git a/lib/llm/src/protocols/openai/chat_completions.rs b/lib/llm/src/protocols/openai/chat_completions.rs
+index f56a978..80d55e6 100644
+--- a/lib/llm/src/protocols/openai/chat_completions.rs
++++ b/lib/llm/src/protocols/openai/chat_completions.rs
+@@ -307,7 +307,7 @@ pub struct NvCreateChatCompletionStreamResponse {
+     /// Internal frontend metrics payload. This must never be serialized to
+     /// client-facing OpenAI-compatible streams.
+     #[serde(default, skip_serializing)]
+-    pub llm_metrics: Option<crate::protocols::common::metrics::LLMMetricAnnotation>,
++    pub llm_metrics: Option<Box<crate::protocols::common::metrics::LLMMetricAnnotation>>,
+     /// Internal transport evidence; the HTTP chat converter removes it before SSE serialization.
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+     pub tool_call_completion: Vec<ToolCallCompletion>,
+diff --git a/lib/llm/src/protocols/openai/chat_completions/delta.rs b/lib/llm/src/protocols/openai/chat_completions/delta.rs
+index ea38696..613a6ba 100644
+--- a/lib/llm/src/protocols/openai/chat_completions/delta.rs
++++ b/lib/llm/src/protocols/openai/chat_completions/delta.rs
+@@ -513,7 +513,7 @@ mod tests {
+         let mut generator = request.response_generator("req-token-details".to_string());
+ 
+         let mut backend_output = final_backend_output();
+-        backend_output.completion_usage = Some(CompletionUsage {
++        backend_output.completion_usage = Some(Box::new(CompletionUsage {
+             prompt_tokens: 5,
+             completion_tokens: 1,
+             total_tokens: 6,
+@@ -522,7 +522,7 @@ mod tests {
+                 reasoning_tokens: Some(3),
+                 ..Default::default()
+             }),
+-        });
++        }));
+ 
+         generator
+             .choice_from_postprocessor(backend_output)
+diff --git a/lib/llm/src/protocols/openai/chat_completions/tool_parser_v2.rs b/lib/llm/src/protocols/openai/chat_completions/tool_parser_v2.rs
+index c2aba13..3e4da3d 100644
+--- a/lib/llm/src/protocols/openai/chat_completions/tool_parser_v2.rs
++++ b/lib/llm/src/protocols/openai/chat_completions/tool_parser_v2.rs
+@@ -898,13 +898,13 @@ mod tests {
+             prompt_tokens_details: None,
+             completion_tokens_details: None,
+         });
+-        data.llm_metrics = Some(crate::protocols::common::metrics::LLMMetricAnnotation {
++        data.llm_metrics = Some(Box::new(crate::protocols::common::metrics::LLMMetricAnnotation {
+             input_tokens: 10,
+             output_tokens: 5,
+             chunk_tokens: 0,
+             cached_tokens: None,
+             ..Default::default()
+-        });
++        }));
+         chunk
+     }
+ 
+@@ -1759,10 +1759,10 @@ mod tests {
+         let choice0 = format!("{MUSE_REASONING}{MUSE_ANSWER}");
+         let mut source = two_choice_chunk(&choice0, MUSE_ANSWER, false);
+         source.data.as_mut().unwrap().llm_metrics =
+-            Some(crate::protocols::common::metrics::LLMMetricAnnotation {
++            Some(Box::new(crate::protocols::common::metrics::LLMMetricAnnotation {
+                 chunk_tokens: 6,
+                 ..Default::default()
+-            });
++            }));
+ 
+         let out = apply_unified_stream(
+             stream::iter([source]),
+diff --git a/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs b/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs
+index 30aa97c..2ce7f18 100644
+--- a/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs
++++ b/lib/llm/src/protocols/openai/chat_completions/unified_parser.rs
+@@ -4719,10 +4719,10 @@ pub(crate) mod tests {
+     async fn qwen_fanout_keeps_source_metrics_on_reasoning() {
+         let mut source = chunk("<think>reason</think>answer", false);
+         source.data.as_mut().unwrap().llm_metrics =
+-            Some(crate::protocols::common::metrics::LLMMetricAnnotation {
++            Some(Box::new(crate::protocols::common::metrics::LLMMetricAnnotation {
+                 chunk_tokens: 4,
+                 ..Default::default()
+-            });
++            }));
+ 
+         let responses = apply_stream(
+             stream::iter([source]),
+@@ -4766,10 +4766,10 @@ pub(crate) mod tests {
+                 choice.delta.reasoning_content = Some(reasoning_text.to_string());
+                 let source = reasoning.data.as_mut().unwrap();
+                 source.nvext = Some(serde_json::json!({"source": "reasoning"}));
+-                source.llm_metrics = Some(crate::protocols::common::metrics::LLMMetricAnnotation {
++                source.llm_metrics = Some(Box::new(crate::protocols::common::metrics::LLMMetricAnnotation {
+                     chunk_tokens: 7,
+                     ..Default::default()
+-                });
++                }));
+                 reasoning.id = Some("reasoning-source-id".to_string());
+                 reasoning.event = Some("reasoning-source-event".to_string());
+                 reasoning.comment = Some(vec!["reasoning-source-comment".to_string()]);
+@@ -4876,10 +4876,10 @@ pub(crate) mod tests {
+                 data.inner.choices[0].delta.content = None;
+                 data.inner.choices[0].delta.reasoning_content = Some("same".to_string());
+                 data.nvext = Some(serde_json::json!({"source": source_id}));
+-                data.llm_metrics = Some(crate::protocols::common::metrics::LLMMetricAnnotation {
++                data.llm_metrics = Some(Box::new(crate::protocols::common::metrics::LLMMetricAnnotation {
+                     chunk_tokens: tokens,
+                     ..Default::default()
+-                });
++                }));
+                 response.id = Some(source_id.to_string());
+                 inputs.push(response);
+             }
+@@ -4944,10 +4944,10 @@ pub(crate) mod tests {
+         choice.delta.reasoning_content = Some("eof thought".to_string());
+         let source = reasoning.data.as_mut().unwrap();
+         source.nvext = Some(serde_json::json!({"source": "reasoning"}));
+-        source.llm_metrics = Some(crate::protocols::common::metrics::LLMMetricAnnotation {
++        source.llm_metrics = Some(Box::new(crate::protocols::common::metrics::LLMMetricAnnotation {
+             chunk_tokens: 9,
+             ..Default::default()
+-        });
++        }));
+         reasoning.id = Some("eof-reasoning-id".to_string());
+         reasoning.event = Some("eof-reasoning-event".to_string());
+         reasoning.comment = Some(vec!["eof-reasoning-comment".to_string()]);
+@@ -5055,10 +5055,10 @@ pub(crate) mod tests {
+         choice.delta.reasoning_content = Some("middle".to_string());
+         let source = reasoning.data.as_mut().unwrap();
+         source.nvext = Some(serde_json::json!({"source": "reasoning"}));
+-        source.llm_metrics = Some(crate::protocols::common::metrics::LLMMetricAnnotation {
++        source.llm_metrics = Some(Box::new(crate::protocols::common::metrics::LLMMetricAnnotation {
+             chunk_tokens: 5,
+             ..Default::default()
+-        });
++        }));
+         reasoning.id = Some("mismatch-reasoning-id".to_string());
+         reasoning.event = Some("mismatch-reasoning-event".to_string());
+         reasoning.comment = Some(vec!["mismatch-reasoning-comment".to_string()]);
+@@ -7642,10 +7642,10 @@ pub(crate) mod tests {
+             choice.delta.reasoning_content = Some("held thought".to_string());
+             let source = reasoning.data.as_mut().unwrap();
+             source.nvext = Some(serde_json::json!({"source": "reasoning"}));
+-            source.llm_metrics = Some(crate::protocols::common::metrics::LLMMetricAnnotation {
++            source.llm_metrics = Some(Box::new(crate::protocols::common::metrics::LLMMetricAnnotation {
+                 chunk_tokens: 7,
+                 ..Default::default()
+-            });
++            }));
+             reasoning.id = Some("reasoning-source-id".to_string());
+             reasoning.event = Some("reasoning-source-event".to_string());
+             reasoning.comment = Some(vec!["reasoning-source-comment".to_string()]);
+@@ -7788,10 +7788,10 @@ pub(crate) mod tests {
+                 choice(1, None, Some(reasoning_one)),
+             ];
+             data.nvext = Some(serde_json::json!({"source": "reasoning"}));
+-            data.llm_metrics = Some(crate::protocols::common::metrics::LLMMetricAnnotation {
++            data.llm_metrics = Some(Box::new(crate::protocols::common::metrics::LLMMetricAnnotation {
+                 chunk_tokens: 11,
+                 ..Default::default()
+-            });
++            }));
+             reasoning.id = Some("shared-reasoning-id".to_string());
+             reasoning.event = Some("shared-reasoning-event".to_string());
+             reasoning.comment = Some(vec!["shared-reasoning-comment".to_string()]);
+diff --git a/lib/llm/tests/postprocessor_parsing_stream.rs b/lib/llm/tests/postprocessor_parsing_stream.rs
+index 05a8b90..e2e84dd 100644
+--- a/lib/llm/tests/postprocessor_parsing_stream.rs
++++ b/lib/llm/tests/postprocessor_parsing_stream.rs
+@@ -4584,12 +4584,12 @@ async fn postprocessor_parsing_stream_nemotron_v3_force_nonempty_flush_drops_llm
+     // No terminal chunk, so the stream takes the EOF fallback that clones the
+     // envelope. The source chunk carries metrics, as it would in production.
+     let mut source = mock_content_chunk("<thi");
+-    source.llm_metrics = Some(LLMMetricAnnotation {
++    source.llm_metrics = Some(Box::new(LLMMetricAnnotation {
+         input_tokens: 7,
+         output_tokens: 3,
+         chunk_tokens: 3,
+         ..Default::default()
+-    });
++    }));
+ 
+     let input_stream = stream::iter(vec![Annotated::from_data(source)]);
+     let output_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> = preprocessor
+diff --git a/lib/llm/tests/test_streaming_tool_parsers.rs b/lib/llm/tests/test_streaming_tool_parsers.rs
+index 0075329..a83c622 100644
+--- a/lib/llm/tests/test_streaming_tool_parsers.rs
++++ b/lib/llm/tests/test_streaming_tool_parsers.rs
+@@ -1934,7 +1934,7 @@ mod tests {
+         let mut chunk = make_chunk(text, finish_reason);
+         let data = chunk.data.as_mut().expect("chunk data");
+         data.nvext = Some(nvext);
+-        data.llm_metrics = Some(LLMMetricAnnotation {
++        data.llm_metrics = Some(Box::new(LLMMetricAnnotation {
+             input_tokens: 7,
+             output_tokens,
+             chunk_tokens,
+@@ -1952,7 +1952,7 @@ mod tests {
+             tokenize_latency: None,
+             detokenize_total_latency: None,
+             detokenize_count: None,
+-        });
++        }));
+         chunk
+     }
+ 
+diff --git a/lib/llm/tests/test_streaming_usage.rs b/lib/llm/tests/test_streaming_usage.rs
+index 5d75857..f4f8fcc 100644
+--- a/lib/llm/tests/test_streaming_usage.rs
++++ b/lib/llm/tests/test_streaming_usage.rs
+@@ -156,7 +156,7 @@ fn build_backend_outputs_with_cached_tokens(cached_tokens: Option<u32>) -> Vec<B
+                     ..Default::default()
+                 }),
+                 completion_tokens_details: None,
+-            }),
++            }).map(Box::new),
+             disaggregated_params: None,
+             encoder_result: None,
+             worker_trace_link: None,
+diff --git a/lib/sidecar/trtllm/src/convert.rs b/lib/sidecar/trtllm/src/convert.rs
+index 3360818..fbf4bba 100644
+--- a/lib/sidecar/trtllm/src/convert.rs
++++ b/lib/sidecar/trtllm/src/convert.rs
+@@ -583,7 +583,7 @@ impl ResponseState {
+             // carries the engine's usage -- including cached_prompt_tokens,
+             // which the frontend forwards to the decode leg and which cannot be
+             // reconstructed client-side.
+-            completion_usage: Some(prefill_usage(reported, self.prompt_tokens)),
++            completion_usage: Some(Box::new(prefill_usage(reported, self.prompt_tokens))),
+             disaggregated_params: Some(disagg::session_to_json(session)?),
+             ..Default::default()
+         })
+@@ -702,10 +702,10 @@ impl ResponseState {
+             top_logprobs,
+             index: Some(0),
+             finish_reason: Some(finish_reason),
+-            completion_usage: Some(CompletionUsage {
++            completion_usage: Some(Box::new(CompletionUsage {
+                 prompt_tokens_details: cached_prompt_tokens(cached_tokens, self.prompt_tokens),
+                 ..usage(self.prompt_tokens, self.completion_tokens)
+-            }),
++            })),
+             ..Default::default()
+         };
+         terminal.stop_reason = finished
+diff --git a/lib/sidecar/vllm/src/convert.rs b/lib/sidecar/vllm/src/convert.rs
+index 8dd67af..05bdd9d 100644
+--- a/lib/sidecar/vllm/src/convert.rs
++++ b/lib/sidecar/vllm/src/convert.rs
+@@ -1425,7 +1425,7 @@ impl ResponseState {
+                 .then_some(StopReason::Int(i64::from(id))),
+             pb::finish_info::StopReason::StopString(value) => Some(StopReason::String(value)),
+         });
+-        mapped.completion_usage = Some(usage(self.prompt_tokens, completion_tokens));
++        mapped.completion_usage = Some(Box::new(usage(self.prompt_tokens, completion_tokens)));
+         if self.mode.is_encode() {
+             if matches!(
+                 mapped.finish_reason,

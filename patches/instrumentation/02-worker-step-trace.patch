@@ -1,0 +1,51 @@
+--- a/components/src/dynamo/sglang/request_handlers/llm/decode_handler.py
++++ b/components/src/dynamo/sglang/request_handlers/llm/decode_handler.py
+@@ -795,13 +795,6 @@
+                         sampling_params
+                     ),
+                 ):
+-                    if _BENCH_EMIT_TS:
+-                        # Benchmark only: stamp each frame with CLOCK_REALTIME ns as an envelope comment.
+-                        out = {
+-                            "_dynamo_annotated": True,
+-                            "data": out,
+-                            "comment": [f"t={time.time_ns()}"],
+-                        }
+                     yield out
+             else:
+                 async for out in self._process_text_stream(
+@@ -902,13 +895,6 @@
+                         sampling_params
+                     ),
+                 ):
+-                    if _BENCH_EMIT_TS:
+-                        # Benchmark only: stamp each frame with CLOCK_REALTIME ns as an envelope comment.
+-                        out = {
+-                            "_dynamo_annotated": True,
+-                            "data": out,
+-                            "comment": [f"t={time.time_ns()}"],
+-                        }
+                     yield out
+             else:
+                 async for out in self._process_text_stream(
+@@ -1082,6 +1068,7 @@
+ 
+                 # With stream_output=True, output_ids contains only new tokens (disjoint)
+                 output_ids = res.get("output_ids", [])
++                stamps = meta_info.get("sarvam_emit_ns") if _BENCH_EMIT_TS else None
+                 # Keep draining empty, non-final chunks after cancellation so the
+                 # abort monitor can run and SGLang can finish request cleanup.
+                 if not output_ids and not finish_reason:
+@@ -1158,6 +1145,12 @@
+                 if engine_data:
+                     out["engine_data"] = engine_data
+                 if not context.is_stopped():
++                    if stamps and len(stamps) == len(output_ids) and all(stamps):
++                        out = {
++                            "_dynamo_annotated": True,
++                            "data": out,
++                            "comment": ["step=" + ",".join(map(str, stamps))],
++                        }
+                     yield out
+ 
+     async def _process_text_stream(

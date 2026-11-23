@@ -1,0 +1,577 @@
+diff --git a/lib/llm/src/http/service/metrics.rs b/lib/llm/src/http/service/metrics.rs
+index aa8825d..7a86b9e 100644
+--- a/lib/llm/src/http/service/metrics.rs
++++ b/lib/llm/src/http/service/metrics.rs
+@@ -2470,6 +2470,191 @@ pub fn process_chat_response_using_event_converter_and_observe_metrics(
+     response_collector: &mut ResponseMetricCollector,
+     http_queue_guard: &mut Option<HttpQueueGuard>,
+     reasoning_field: ReasoningField,
++) -> Result<Option<Event>, axum::Error> {
++    process_chat_response_with_template(
++        annotated,
++        response_collector,
++        http_queue_guard,
++        reasoning_field,
++        &mut ChatChunkTemplate::disabled(),
++    )
++}
++
++/// How the per-stream SSE chunk template is used. Set once from `DYN_HTTP_SSE_TEMPLATE`:
++/// unset/other = off, `1` = on, `verify` = on, and every templated chunk is also serialised
++/// with serde and compared (a mismatch is logged and the serde output is sent).
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++enum TemplateMode {
++    Off,
++    On,
++    Verify,
++}
++
++fn sse_template_mode() -> TemplateMode {
++    static MODE: std::sync::OnceLock<TemplateMode> = std::sync::OnceLock::new();
++    *MODE.get_or_init(
++        || match std::env::var("DYN_HTTP_SSE_TEMPLATE").as_deref() {
++            Ok("1") | Ok("true") | Ok("on") => TemplateMode::On,
++            Ok("verify") => TemplateMode::Verify,
++            _ => TemplateMode::Off,
++        },
++    )
++}
++
++static TEMPLATE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static TEMPLATE_MISMATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++/// The constant parts of one stream's content chunks, cut out of serde's own output.
++struct RenderedChunkTemplate {
++    // Values the template was cut for; a chunk that differs takes the serde path.
++    id: String,
++    model: String,
++    created: u32,
++    index: u32,
++    /// `{"id":"...","choices":[{"index":0,"delta":{"content":`
++    prefix: Vec<u8>,
++    /// `},"finish_reason":null,"logprobs":null}],"created":...,"model":"...","object":"..."}`
++    suffix: Vec<u8>,
++}
++
++/// Pre-rendered JSON for the plain content chunks of one chat stream.
++///
++/// Almost every chunk of a stream is the same JSON object with a different `content`
++/// string. The first such chunk is serialised with serde and split around its content;
++/// later ones are written as prefix + escaped content + suffix into a reused buffer, with
++/// no struct serialisation and no new `String`. Any chunk that is not a plain content
++/// chunk (role, finish_reason, usage, tool calls, nvext, ...) takes the serde path.
++pub struct ChatChunkTemplate {
++    mode: TemplateMode,
++    rendered: Option<RenderedChunkTemplate>,
++    scratch: Vec<u8>,
++}
++
++impl ChatChunkTemplate {
++    pub fn from_env() -> Self {
++        Self {
++            mode: sse_template_mode(),
++            rendered: None,
++            scratch: Vec::new(),
++        }
++    }
++
++    pub fn disabled() -> Self {
++        Self {
++            mode: TemplateMode::Off,
++            rendered: None,
++            scratch: Vec::new(),
++        }
++    }
++
++    /// The content text, if this chunk has the plain shape the template covers.
++    #[allow(deprecated)]
++    fn plain_content(chunk: &NvCreateChatCompletionStreamResponse) -> Option<&str> {
++        let inner = &chunk.inner;
++        if chunk.nvext.is_some()
++            || !chunk.tool_call_completion.is_empty()
++            || inner.usage.is_some()
++            || inner.service_tier.is_some()
++            || inner.system_fingerprint.is_some()
++            || inner.choices.len() != 1
++        {
++            return None;
++        }
++        let choice = &inner.choices[0];
++        if choice.finish_reason.is_some() || choice.logprobs.is_some() {
++            return None;
++        }
++        let delta = &choice.delta;
++        if delta.role.is_some()
++            || delta.tool_calls.is_some()
++            || delta.function_call.is_some()
++            || delta.refusal.is_some()
++            || delta.reasoning_content.is_some()
++        {
++            return None;
++        }
++        match &delta.content {
++            Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(text)) => Some(text),
++            _ => None,
++        }
++    }
++
++    /// Serialise `chunk` once with serde and split the output around its content string.
++    fn cut(
++        chunk: &NvCreateChatCompletionStreamResponse,
++        content: &str,
++    ) -> Option<RenderedChunkTemplate> {
++        // Raw quotes cannot occur inside a JSON string, so this can only match the real key.
++        const NEEDLE: &str = "\"delta\":{\"content\":";
++        let json = serde_json::to_string(chunk).ok()?;
++        let escaped = serde_json::to_string(content).ok()?;
++        let start = json.find(NEEDLE)? + NEEDLE.len();
++        if !json[start..].starts_with(&escaped) {
++            return None;
++        }
++        Some(RenderedChunkTemplate {
++            id: chunk.inner.id.clone(),
++            model: chunk.inner.model.clone(),
++            created: chunk.inner.created,
++            index: chunk.inner.choices[0].index,
++            prefix: json.as_bytes()[..start].to_vec(),
++            suffix: json.as_bytes()[start + escaped.len()..].to_vec(),
++        })
++    }
++
++    /// The chunk's JSON from the template, or `None` when it must be serialised with serde.
++    fn render(&mut self, chunk: &NvCreateChatCompletionStreamResponse) -> Option<&str> {
++        if self.mode == TemplateMode::Off {
++            return None;
++        }
++        let content = Self::plain_content(chunk)?;
++        if self.rendered.is_none() {
++            self.rendered = Self::cut(chunk, content);
++        }
++        let rendered = self.rendered.as_ref()?;
++        let inner = &chunk.inner;
++        if inner.choices[0].index != rendered.index
++            || inner.created != rendered.created
++            || inner.id != rendered.id
++            || inner.model != rendered.model
++        {
++            return None;
++        }
++        self.scratch.clear();
++        self.scratch.extend_from_slice(&rendered.prefix);
++        // serde_json's own string escaping, appended in place.
++        serde_json::to_writer(&mut self.scratch, content).ok()?;
++        self.scratch.extend_from_slice(&rendered.suffix);
++        let json = std::str::from_utf8(&self.scratch).ok()?;
++        if self.mode == TemplateMode::Verify {
++            let expected = serde_json::to_string(chunk).ok()?;
++            if expected != json {
++                TEMPLATE_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                tracing::error!(template = json, serde = %expected, "SSE template mismatch");
++                return None;
++            }
++            let hits = TEMPLATE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++            if hits % 50_000 == 0 {
++                tracing::info!(
++                    hits,
++                    mismatches = TEMPLATE_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed),
++                    "SSE template verify"
++                );
++            }
++        }
++        Some(json)
++    }
++}
++
++/// [`process_chat_response_using_event_converter_and_observe_metrics`] with a per-stream
++/// [`ChatChunkTemplate`]. Metrics are observed first, exactly as before; only the JSON
++/// encoding of plain content chunks changes.
++pub fn process_chat_response_with_template(
++    annotated: EventConverter<NvCreateChatCompletionStreamResponse>,
++    response_collector: &mut ResponseMetricCollector,
++    http_queue_guard: &mut Option<HttpQueueGuard>,
++    reasoning_field: ReasoningField,
++    template: &mut ChatChunkTemplate,
+ ) -> Result<Option<Event>, axum::Error> {
+     let mut annotated = annotated.0;
+     if let Some(data) = annotated.data.as_mut() {
+@@ -2500,6 +2685,22 @@ pub fn process_chat_response_using_event_converter_and_observe_metrics(
+         annotated.data = None;
+     }
+ 
++    // Template fast path: a bare data chunk with the default reasoning field.
++    if reasoning_field == ReasoningField::ReasoningContent
++        && annotated.event.is_none()
++        && annotated.error.is_none()
++        && let Some(data) = annotated.data.as_ref()
++        && let Some(json) = template.render(data)
++    {
++        let mut event = Event::default().data(json);
++        if let Some(comments) = annotated.comment.as_ref() {
++            for comment in comments {
++                event = event.comment(comment.replace(['\n', '\r'], " "));
++            }
++        }
++        return Ok(Some(event));
++    }
++
+     // Route reasoning at the SSE boundary. Internal representation stays
+     // `reasoning_content`.
+     let annotated =
+@@ -5260,3 +5461,321 @@ mod tests {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod chunk_template_tests {
++    use super::*;
++    use crate::types::Annotated;
++    use axum::response::IntoResponse;
++    use axum::response::Sse;
++
++    type Chunk = NvCreateChatCompletionStreamResponse;
++
++    fn template(mode: TemplateMode) -> ChatChunkTemplate {
++        ChatChunkTemplate {
++            mode,
++            rendered: None,
++            scratch: Vec::new(),
++        }
++    }
++
++    fn chunk(value: serde_json::Value) -> Chunk {
++        serde_json::from_value(value).expect("valid chunk")
++    }
++
++    fn content_chunk(content: &str) -> Chunk {
++        chunk(serde_json::json!({
++            "id": "chatcmpl-x", "object": "chat.completion.chunk", "created": 7,
++            "model": "test-model",
++            "choices": [{"index": 0, "delta": {"content": content}}]
++        }))
++    }
++
++    fn serde(chunk: &Chunk) -> String {
++        serde_json::to_string(chunk).unwrap()
++    }
++
++    /// The bytes a client receives for one converted chunk.
++    async fn wire(event: Event) -> String {
++        let sse = Sse::new(futures::stream::once(async move {
++            Ok::<_, std::convert::Infallible>(event)
++        }));
++        let bytes = axum::body::to_bytes(sse.into_response().into_body(), usize::MAX)
++            .await
++            .unwrap();
++        String::from_utf8(bytes.to_vec()).unwrap()
++    }
++
++    #[test]
++    fn off_mode_never_renders() {
++        let mut t = template(TemplateMode::Off);
++        assert!(t.render(&content_chunk("hello")).is_none());
++        assert!(t.rendered.is_none());
++    }
++
++    #[test]
++    fn plain_chunks_match_serde_byte_for_byte() {
++        let contents = [
++            "hello",
++            "",
++            " ",
++            "a \"quoted\" word",
++            "back\\slash",
++            "line\nbreak\r\ttab",
++            "\u{0000}\u{0001}\u{001f}\u{007f}",
++            "ünïcödé 日本語 🙂",
++            "\u{2028}\u{2029}",
++            "</script>",
++            // Content that looks like the template's own split marker.
++            "\"delta\":{\"content\":\"x\"}",
++            "},\"finish_reason\":null",
++        ];
++        for mode in [TemplateMode::On, TemplateMode::Verify] {
++            let mut t = template(mode);
++            for content in contents {
++                let c = content_chunk(content);
++                let json = t.render(&c).expect("plain chunk renders").to_owned();
++                assert_eq!(json, serde(&c), "content {content:?} in {mode:?}");
++            }
++        }
++    }
++
++    #[test]
++    fn first_chunk_is_also_templated_and_correct() {
++        let mut t = template(TemplateMode::On);
++        let c = content_chunk("first");
++        assert_eq!(t.render(&c).unwrap(), serde(&c));
++        assert!(t.rendered.is_some());
++    }
++
++    #[test]
++    fn non_plain_chunks_take_the_serde_path() {
++        let base = |delta: serde_json::Value, extra: serde_json::Value| {
++            let mut v = serde_json::json!({
++                "id": "chatcmpl-x", "object": "chat.completion.chunk", "created": 7,
++                "model": "test-model",
++                "choices": [{"index": 0, "delta": delta}]
++            });
++            for (k, val) in extra.as_object().unwrap() {
++                if k == "finish_reason" || k == "logprobs" {
++                    v["choices"][0][k] = val.clone();
++                } else {
++                    v[k] = val.clone();
++                }
++            }
++            chunk(v)
++        };
++        let none = serde_json::json!({});
++        let cases: Vec<(&str, Chunk)> = vec![
++            ("role", base(serde_json::json!({"role": "assistant", "content": "x"}), none.clone())),
++            ("no content", base(serde_json::json!({}), none.clone())),
++            ("reasoning", base(serde_json::json!({"content": "x", "reasoning_content": "r"}), none.clone())),
++            ("refusal", base(serde_json::json!({"content": "x", "refusal": "no"}), none.clone())),
++            (
++                "tool call",
++                base(
++                    serde_json::json!({"tool_calls": [{"index": 0, "id": "c", "type": "function",
++                        "function": {"name": "f", "arguments": "{}"}}]}),
++                    none.clone(),
++                ),
++            ),
++            ("finish_reason", base(serde_json::json!({"content": "x"}), serde_json::json!({"finish_reason": "stop"}))),
++            (
++                "logprobs",
++                base(serde_json::json!({"content": "x"}), serde_json::json!({"logprobs": {"content": []}})),
++            ),
++            (
++                "usage",
++                base(
++                    serde_json::json!({"content": "x"}),
++                    serde_json::json!({"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
++                ),
++            ),
++            ("system_fingerprint", base(serde_json::json!({"content": "x"}), serde_json::json!({"system_fingerprint": "fp"}))),
++            ("nvext", base(serde_json::json!({"content": "x"}), serde_json::json!({"nvext": {"k": 1}}))),
++        ];
++        for (name, c) in cases {
++            // Both before and after a template exists.
++            let mut fresh = template(TemplateMode::On);
++            assert!(fresh.render(&c).is_none(), "{name}: fresh template");
++            assert!(fresh.rendered.is_none(), "{name}: must not cut a template");
++            let mut warm = template(TemplateMode::On);
++            warm.render(&content_chunk("warm")).unwrap();
++            assert!(warm.render(&c).is_none(), "{name}: warm template");
++        }
++    }
++
++    #[test]
++    fn two_choices_take_the_serde_path() {
++        let c = chunk(serde_json::json!({
++            "id": "chatcmpl-x", "object": "chat.completion.chunk", "created": 7,
++            "model": "test-model",
++            "choices": [{"index": 0, "delta": {"content": "a"}}, {"index": 1, "delta": {"content": "b"}}]
++        }));
++        assert!(template(TemplateMode::On).render(&c).is_none());
++    }
++
++    #[test]
++    fn changed_envelope_falls_back_and_template_stays_valid() {
++        let mut t = template(TemplateMode::On);
++        let first = content_chunk("one");
++        t.render(&first).unwrap();
++
++        let mut other_id = content_chunk("two");
++        other_id.inner.id = "chatcmpl-y".to_string();
++        let mut other_model = content_chunk("two");
++        other_model.inner.model = "other".to_string();
++        let mut other_created = content_chunk("two");
++        other_created.inner.created = 8;
++        let mut other_index = content_chunk("two");
++        other_index.inner.choices[0].index = 1;
++        for c in [&other_id, &other_model, &other_created, &other_index] {
++            assert!(t.render(c).is_none());
++        }
++
++        // The stream's own chunks still render from the original template.
++        let next = content_chunk("three");
++        assert_eq!(t.render(&next).unwrap(), serde(&next));
++    }
++
++    #[test]
++    fn template_is_cut_from_the_first_plain_chunk_after_a_role_chunk() {
++        let mut t = template(TemplateMode::On);
++        let role = chunk(serde_json::json!({
++            "id": "chatcmpl-x", "object": "chat.completion.chunk", "created": 7,
++            "model": "test-model",
++            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]
++        }));
++        assert!(t.render(&role).is_none());
++        let c = content_chunk("hi");
++        assert_eq!(t.render(&c).unwrap(), serde(&c));
++    }
++
++    #[test]
++    fn scratch_buffer_does_not_leak_between_chunks() {
++        let mut t = template(TemplateMode::On);
++        let long = content_chunk(&"x".repeat(4096));
++        assert_eq!(t.render(&long).unwrap(), serde(&long));
++        let short = content_chunk("y");
++        assert_eq!(t.render(&short).unwrap(), serde(&short));
++    }
++
++    /// End to end through the converter: the client bytes are the same with the template
++    /// on and off, including SSE comments.
++    #[tokio::test]
++    async fn converter_output_is_identical_with_and_without_template() {
++        let registry = Registry::new();
++        let metrics = Arc::new(Metrics::new());
++        metrics.register(&registry).unwrap();
++        let mut collector = metrics.clone().create_response_collector("test-model");
++        let mut guard = None;
++        let mut on = template(TemplateMode::On);
++
++        for (content, comment) in [
++            ("one", None),
++            ("two \"quoted\"\n", Some(vec!["t=1700000000000000000".to_string()])),
++            ("three", Some(vec!["multi\nline".to_string(), "second".to_string()])),
++        ] {
++            let annotated = || Annotated {
++                id: None,
++                data: Some(content_chunk(content)),
++                event: None,
++                comment: comment.clone(),
++                error: None,
++            };
++            let old = process_chat_response_using_event_converter_and_observe_metrics(
++                EventConverter::from(annotated()),
++                &mut collector,
++                &mut guard,
++                ReasoningField::ReasoningContent,
++            )
++            .unwrap()
++            .unwrap();
++            let new = process_chat_response_with_template(
++                EventConverter::from(annotated()),
++                &mut collector,
++                &mut guard,
++                ReasoningField::ReasoningContent,
++                &mut on,
++            )
++            .unwrap()
++            .unwrap();
++            assert_eq!(wire(new).await, wire(old).await, "content {content:?}");
++        }
++        assert!(on.rendered.is_some(), "the template path was taken");
++    }
++
++    #[tokio::test]
++    async fn non_default_reasoning_field_bypasses_the_template() {
++        let registry = Registry::new();
++        let metrics = Arc::new(Metrics::new());
++        metrics.register(&registry).unwrap();
++        let mut collector = metrics.clone().create_response_collector("test-model");
++        let mut guard = None;
++        let mut on = template(TemplateMode::On);
++        let annotated = Annotated {
++            id: None,
++            data: Some(content_chunk("x")),
++            event: None,
++            comment: None,
++            error: None,
++        };
++        let _event = process_chat_response_with_template(
++            EventConverter::from(annotated),
++            &mut collector,
++            &mut guard,
++            ReasoningField::Reasoning,
++            &mut on,
++        )
++        .unwrap()
++        .unwrap();
++        assert!(on.rendered.is_none());
++    }
++
++    #[tokio::test]
++    async fn events_and_errors_bypass_the_template() {
++        let registry = Registry::new();
++        let metrics = Arc::new(Metrics::new());
++        metrics.register(&registry).unwrap();
++        let mut collector = metrics.clone().create_response_collector("test-model");
++        let mut guard = None;
++        let mut on = template(TemplateMode::On);
++
++        let with_event = Annotated {
++            id: None,
++            data: Some(content_chunk("x")),
++            event: Some("custom".to_string()),
++            comment: None,
++            error: None,
++        };
++        let event = process_chat_response_with_template(
++            EventConverter::from(with_event),
++            &mut collector,
++            &mut guard,
++            ReasoningField::ReasoningContent,
++            &mut on,
++        )
++        .unwrap()
++        .unwrap();
++        assert!(wire(event).await.contains("event: custom"));
++        assert!(on.rendered.is_none(), "an event chunk must not use the template");
++
++        let error = Annotated::<Chunk> {
++            id: None,
++            data: None,
++            event: Some("error".to_string()),
++            comment: None,
++            error: None,
++        };
++        assert!(
++            process_chat_response_with_template(
++                EventConverter::from(error),
++                &mut collector,
++                &mut guard,
++                ReasoningField::ReasoningContent,
++                &mut on,
++            )
++            .is_err()
++        );
++    }
++}
+diff --git a/lib/llm/src/http/service/openai.rs b/lib/llm/src/http/service/openai.rs
+index 7858f99..94cf2e8 100644
+--- a/lib/llm/src/http/service/openai.rs
++++ b/lib/llm/src/http/service/openai.rs
+@@ -49,7 +49,7 @@ use super::{
+     metrics::{
+         CancellationLabels, Endpoint, ErrorType, EventConverter,
+         process_chat_response_and_observe_metrics,
+-        process_chat_response_using_event_converter_and_observe_metrics,
++        process_chat_response_with_template, ChatChunkTemplate,
+         process_response_and_observe_metrics,
+         process_response_using_event_converter_and_observe_metrics,
+     },
+@@ -3653,6 +3653,8 @@ async fn chat_completions(
+         let tool_dispatch_enabled = state.streaming_tool_dispatch_enabled();
+         let reasoning_dispatch_enabled = state.streaming_reasoning_dispatch_enabled();
+         let reasoning_field = state.reasoning_field();
++        // Per-stream SSE chunk template; off unless DYN_HTTP_SSE_TEMPLATE is set.
++        let mut chunk_template = ChatChunkTemplate::from_env();
+         let mut reasoning_buffer: HashMap<u32, String> = HashMap::new();
+         let mut dispatched_tool_ids: HashSet<(u32, String)> = HashSet::new();
+         let mut emitted_roles: HashSet<u32> = HashSet::new();
+@@ -3729,11 +3731,12 @@ async fn chat_completions(
+ 
+                 // Convert to SSE event (this consumes the response).
+                 // EventConverter will detect `event: "error"` and convert to SSE error events.
+-                let sse_result = process_chat_response_using_event_converter_and_observe_metrics(
++                let sse_result = process_chat_response_with_template(
+                     EventConverter::from(response),
+                     &mut response_collector,
+                     &mut http_queue_guard,
+                     reasoning_field,
++                    &mut chunk_template,
+                 );
+ 
+                 if semantic_error && matches!(&sse_result, Ok(Some(_))) {

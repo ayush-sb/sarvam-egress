@@ -1,0 +1,1069 @@
+diff --git a/lib/backend-common/src/engine.rs b/lib/backend-common/src/engine.rs
+index e517fa3..f7d1e6b 100644
+--- a/lib/backend-common/src/engine.rs
++++ b/lib/backend-common/src/engine.rs
+@@ -656,7 +656,7 @@ impl LLMEngineOutputExt for LLMEngineOutput {
+         mut self,
+         encoder_result: serde_json::Map<String, serde_json::Value>,
+     ) -> Self {
+-        self.encoder_result = Some(serde_json::Value::Object(encoder_result));
++        self.encoder_result = Some(Box::new(serde_json::Value::Object(encoder_result)));
+         self
+     }
+ }
+diff --git a/lib/llm/src/backend.rs b/lib/llm/src/backend.rs
+index 5556198..82232d8 100644
+--- a/lib/llm/src/backend.rs
++++ b/lib/llm/src/backend.rs
+@@ -406,7 +406,7 @@ impl
+                             if state.migration_possible
+                                 && let Some(data) = &mut output.data
+                             {
+-                                data.jailed_text = decoder.checkpoint();
++                                data.jailed_text = decoder.checkpoint().map(Box::new);
+                             }
+                         }
+                         return Some((output, state));
+@@ -548,7 +548,7 @@ impl
+                     // Skipped when migration can't happen: nothing will ever read this
+                     // checkpoint, so there is no reason to allocate a snapshot of it.
+                     if state.migration_possible {
+-                        data.jailed_text = decoder.checkpoint();
++                        data.jailed_text = decoder.checkpoint().map(Box::new);
+                     }
+ 
+                     output.data = Some(data);
+@@ -2488,7 +2488,7 @@ mod tests {
+             .collect();
+ 
+         assert_eq!(
+-            data[0].jailed_text.as_deref(),
++            data[0].jailed_text.as_deref().map(|checkpoint| &**checkpoint),
+             Some("o"),
+             "the decoder-driven chunk must publish what it withheld"
+         );
+@@ -2497,7 +2497,7 @@ mod tests {
+         // still reflect the still-withheld "o" -- not look resolved just because this
+         // particular chunk skipped the decoder.
+         assert_eq!(
+-            data[1].jailed_text.as_deref(),
++            data[1].jailed_text.as_deref().map(|checkpoint| &**checkpoint),
+             Some("o"),
+             "a non-terminal bypass chunk must not erase the withheld-text checkpoint"
+         );
+diff --git a/lib/llm/src/kv_router/encoder_router.rs b/lib/llm/src/kv_router/encoder_router.rs
+index 220c51f..c5e0673 100644
+--- a/lib/llm/src/kv_router/encoder_router.rs
++++ b/lib/llm/src/kv_router/encoder_router.rs
+@@ -314,6 +314,7 @@ impl EncoderRouter {
+         let terminal = terminal.context("Encode worker stream ended without a terminal chunk")?;
+         let result = terminal
+             .encoder_result
++            .map(|boxed| *boxed)
+             .filter(serde_json::Value::is_object)
+             .context("Encode worker terminal is missing an object-shaped encoder_result")?;
+         Ok((result, terminal.worker_trace_link.map(|boxed| *boxed)))
+diff --git a/lib/llm/src/kv_router/prefill_router/admission.rs b/lib/llm/src/kv_router/prefill_router/admission.rs
+index a7e83e1..393f678 100644
+--- a/lib/llm/src/kv_router/prefill_router/admission.rs
++++ b/lib/llm/src/kv_router/prefill_router/admission.rs
+@@ -112,7 +112,7 @@ impl PrefillRouter {
+                 "Prefill router output has no data field".to_string(),
+             ));
+         };
+-        let Some(disaggregated_params) = output.disaggregated_params.clone() else {
++        let Some(disaggregated_params) = output.disaggregated_params.as_deref().cloned() else {
+             return Err(PrefillError::NoDisaggregatedParams(
+                 "Prefill router output missing disaggregated_params".to_string(),
+             ));
+@@ -188,7 +188,7 @@ mod tests {
+ 
+     fn valid_prefill_output() -> Annotated<LLMEngineOutput> {
+         Annotated::from_data(LLMEngineOutput {
+-            disaggregated_params: Some(json!({})),
++            disaggregated_params: Some(Box::new(json!({}))),
+             ..Default::default()
+         })
+     }
+@@ -201,9 +201,9 @@ mod tests {
+             Annotated::from_data(LLMEngineOutput::cancelled()),
+         ] {
+             let first = Annotated::from_data(LLMEngineOutput {
+-                disaggregated_params: Some(json!({
++                disaggregated_params: Some(Box::new(json!({
+                     "bootstrap_host": "prefill", "bootstrap_port": 1, "bootstrap_room": 7,
+-                })),
++                }))),
+                 ..Default::default()
+             });
+             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+@@ -247,12 +247,12 @@ mod tests {
+     #[tokio::test]
+     async fn bootstrap_drain_retains_teardown_guard_until_stream_finishes() {
+         let first = Annotated::from_data(LLMEngineOutput {
+-            disaggregated_params: Some(json!({
++            disaggregated_params: Some(Box::new(json!({
+                 "bootstrap_host": "127.0.0.1",
+                 "bootstrap_port": 1,
+                 "bootstrap_room": "test",
+                 "ctx_request_id": 42,
+-            })),
++            }))),
+             ..Default::default()
+         });
+         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+@@ -356,7 +356,7 @@ mod tests {
+     async fn length_limited_prefill_still_requires_handoff() {
+         let output = LLMEngineOutput {
+             finish_reason: Some(FinishReason::Length),
+-            disaggregated_params: Some(json!({"ctx_request_id": 42})),
++            disaggregated_params: Some(Box::new(json!({"ctx_request_id": 42}))),
+             ..Default::default()
+         };
+         let result = PrefillRouter::consume_prefill_stream(
+@@ -377,7 +377,7 @@ mod tests {
+     async fn unfinished_prefill_still_requires_handoff() {
+         let output = LLMEngineOutput {
+             finish_reason: None,
+-            disaggregated_params: Some(json!({"ctx_request_id": 42})),
++            disaggregated_params: Some(Box::new(json!({"ctx_request_id": 42}))),
+             ..Default::default()
+         };
+         let result = PrefillRouter::consume_prefill_stream(
+@@ -402,7 +402,7 @@ mod tests {
+         ] {
+             let output = LLMEngineOutput {
+                 finish_reason: None,
+-                disaggregated_params: Some(disaggregated_params),
++                disaggregated_params: Some(Box::new(disaggregated_params)),
+                 ..Default::default()
+             };
+             let result = PrefillRouter::consume_prefill_stream(
+diff --git a/lib/llm/src/kv_router/prefill_router/mod.rs b/lib/llm/src/kv_router/prefill_router/mod.rs
+index fef057d..3898f4b 100644
+--- a/lib/llm/src/kv_router/prefill_router/mod.rs
++++ b/lib/llm/src/kv_router/prefill_router/mod.rs
+@@ -1096,9 +1096,9 @@ mod tests {
+             let mut outputs = Vec::new();
+             if after_handoff {
+                 outputs.push(Annotated::from_data(LLMEngineOutput {
+-                    disaggregated_params: Some(serde_json::json!({
++                    disaggregated_params: Some(Box::new(serde_json::json!({
+                         "bootstrap_host": "prefill", "bootstrap_port": 1, "bootstrap_room": 7,
+-                    })),
++                    }))),
+                     ..Default::default()
+                 }));
+             }
+@@ -1281,10 +1281,10 @@ mod tests {
+         let output = Annotated::from_data(LLMEngineOutput {
+             token_ids: vec![2],
+             finish_reason: Some(FinishReason::EoS),
+-            disaggregated_params: Some(serde_json::json!({
++            disaggregated_params: Some(Box::new(serde_json::json!({
+                 "ctx_request_id": null,
+                 "request_type": "context_only",
+-            })),
++            }))),
+             ..Default::default()
+         });
+ 
+diff --git a/lib/llm/src/kv_router/routing_host/tests.rs b/lib/llm/src/kv_router/routing_host/tests.rs
+index 85296dc..ae08a76 100644
+--- a/lib/llm/src/kv_router/routing_host/tests.rs
++++ b/lib/llm/src/kv_router/routing_host/tests.rs
+@@ -762,12 +762,12 @@ async fn run_kv_hit_attempt(final_frame: LLMEngineOutput) -> (KvHitSnapshot, KvH
+ async fn kv_cache_hit_complete_attempt_records_every_stage_once() {
+     let (before, after) = run_kv_hit_attempt(LLMEngineOutput {
+         finish_reason: Some(FinishReason::Stop),
+-        engine_data: Some(serde_json::json!({
++        engine_data: Some(Box::new(serde_json::json!({
+             "kv_cache_hit": {
+                 "prompt_tokens": 100,
+                 "reused_tokens": 85,
+             }
+-        })),
++        }))),
+         ..Default::default()
+     })
+     .await;
+@@ -794,12 +794,12 @@ async fn kv_cache_hit_attempt_without_worker_report_contributes_zero() {
+ async fn kv_cache_hit_cancelled_attempt_keeps_reported_reuse() {
+     let (before, after) = run_kv_hit_attempt(LLMEngineOutput {
+         finish_reason: Some(FinishReason::Cancelled),
+-        engine_data: Some(serde_json::json!({
++        engine_data: Some(Box::new(serde_json::json!({
+             "kv_cache_hit": {
+                 "prompt_tokens": 100,
+                 "reused_tokens": 85,
+             }
+-        })),
++        }))),
+         ..Default::default()
+     })
+     .await;
+@@ -849,9 +849,9 @@ async fn kv_cache_hit_counts_immediately_once_in_selection_phase(#[case] reused:
+     let _permit = tracker.set_phase(RequestPhase::Decode).await;
+     guard
+         .on_item(&Annotated::from_data(LLMEngineOutput {
+-            engine_data: Some(serde_json::json!({"kv_cache_hit": {
++            engine_data: Some(Box::new(serde_json::json!({"kv_cache_hit": {
+                 "prompt_tokens": 1, "reused_tokens": reused
+-            }})),
++            }}))),
+             ..Default::default()
+         }))
+         .await;
+@@ -864,9 +864,9 @@ async fn kv_cache_hit_counts_immediately_once_in_selection_phase(#[case] reused:
+     );
+     guard
+         .on_item(&Annotated::from_data(LLMEngineOutput {
+-            engine_data: Some(serde_json::json!({"kv_cache_hit": {
++            engine_data: Some(Box::new(serde_json::json!({"kv_cache_hit": {
+                 "prompt_tokens": 1, "reused_tokens": 9
+-            }})),
++            }}))),
+             ..Default::default()
+         }))
+         .await;
+diff --git a/lib/llm/src/migration.rs b/lib/llm/src/migration.rs
+index 8b40ae3..084e069 100644
+--- a/lib/llm/src/migration.rs
++++ b/lib/llm/src/migration.rs
+@@ -54,7 +54,7 @@ impl HasTokenIds for BackendOutput {
+         self.worker_trace_link.as_deref()
+     }
+     fn decoder_checkpoint(&self) -> Option<&DecoderCheckpoint> {
+-        self.jailed_text.as_ref()
++        self.jailed_text.as_deref()
+     }
+ }
+ 
+@@ -66,7 +66,7 @@ impl HasTokenIds for LLMEngineOutput {
+         self.worker_trace_link.as_deref()
+     }
+     fn decoder_checkpoint(&self) -> Option<&DecoderCheckpoint> {
+-        self.jailed_text.as_ref()
++        self.jailed_text.as_deref()
+     }
+ }
+ 
+@@ -2883,7 +2883,7 @@ mod tests {
+                     );
+                     let responses = stream::iter(vec![
+                         Annotated::from_data(BackendOutput {
+-                            jailed_text: Some("STOP".to_string().into()),
++                            jailed_text: Some(Box::new("STOP".to_string().into())),
+                             ..create_mock_output(10).data.unwrap()
+                         }),
+                         Annotated::from_err(
+diff --git a/lib/llm/src/mocker.rs b/lib/llm/src/mocker.rs
+index 8d93a1a..1022909 100644
+--- a/lib/llm/src/mocker.rs
++++ b/lib/llm/src/mocker.rs
+@@ -1173,7 +1173,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
+                         // final chunk repeats cumulative totals (OpenAI convention).
+                         let output = LLMEngineOutput {
+                             token_ids: vec![token_id],
+-                            disaggregated_params: is_prefill.then(|| serde_json::json!("dummy")),
++                            disaggregated_params: is_prefill.then(|| Box::new(serde_json::json!("dummy"))),
+                             completion_usage: signal.cached_tokens.map(|cached| {
+                                 usage_with_cached_tokens(prompt_tokens_count, token_count, cached)
+                             }).map(Box::new),
+diff --git a/lib/llm/src/mocker/sglang.rs b/lib/llm/src/mocker/sglang.rs
+index 0c6e8cd..1d3e9fa 100644
+--- a/lib/llm/src/mocker/sglang.rs
++++ b/lib/llm/src/mocker/sglang.rs
+@@ -66,7 +66,7 @@ pub(super) fn adapt(
+         completion_tokens,
+         output.finish_reason.as_ref().map(native_finish_reason),
+     );
+-    output.engine_data = Some(json!({"sglang_response": response}));
++    output.engine_data = Some(Box::new(json!({"sglang_response": response})));
+ }
+ 
+ fn native_finish_reason(reason: &FinishReason) -> Value {
+diff --git a/lib/llm/src/protocols/common/llm_backend.rs b/lib/llm/src/protocols/common/llm_backend.rs
+index 4324b9b..cf48499 100644
+--- a/lib/llm/src/protocols/common/llm_backend.rs
++++ b/lib/llm/src/protocols/common/llm_backend.rs
+@@ -167,14 +167,14 @@ pub struct BackendOutput {
+     /// encoded `LlmDisaggregatedParams`). Dynamo does NOT inject framework
+     /// metadata into this field — use `worker_trace_link` instead.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub disaggregated_params: Option<serde_json::Value>,
++    pub disaggregated_params: Option<Box<serde_json::Value>>,
+ 
+     /// Multimodal encoder handoff payload (object-only by contract).
+     /// Set by Encode workers on their terminal chunk; consumed by the
+     /// frontend and threaded onto the downstream PreprocessedRequest.
+     /// Engine-opaque; framework does not inspect.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub encoder_result: Option<serde_json::Value>,
++    pub encoder_result: Option<Box<serde_json::Value>>,
+ 
+     /// Framework-owned link to the prefill worker's span. Propagated
+     /// alongside the engine's `disaggregated_params` so the decode worker
+@@ -186,7 +186,7 @@ pub struct BackendOutput {
+     /// Opaque engine data passed through from the backend worker to the response.
+     /// Dynamo does not inspect this field; it is serialized as-is into `nvext.engine_data`.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub engine_data: Option<serde_json::Value>,
++    pub engine_data: Option<Box<serde_json::Value>>,
+ 
+     /// Router-computed data handed back to the frontend (e.g. per-request timing from
+     /// a standalone router) so it joins this request's trace/metrics. Dynamo-internal,
+@@ -198,7 +198,7 @@ pub struct BackendOutput {
+     /// representation remains the historical optional `jailed_text` string; pending token
+     /// IDs are in-memory-only and let the retry reconstruct incremental decoding state.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub jailed_text: Option<DecoderCheckpoint>,
++    pub jailed_text: Option<Box<DecoderCheckpoint>>,
+ }
+ 
+ /// The LLM engine and backnd with manage it's own state, specifically translating how a
+@@ -251,7 +251,7 @@ pub struct LLMEngineOutput {
+ 
+     /// Disaggregated execution parameters (for prefill/decode separation)
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub disaggregated_params: Option<serde_json::Value>,
++    pub disaggregated_params: Option<Box<serde_json::Value>>,
+ 
+     /// Multimodal encoder handoff payload (object-only by contract).
+     /// Set by Encode workers on their terminal chunk via
+@@ -259,7 +259,7 @@ pub struct LLMEngineOutput {
+     /// through to `BackendOutput.encoder_result`. Engine-opaque payload;
+     /// framework does not inspect or mutate.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub encoder_result: Option<serde_json::Value>,
++    pub encoder_result: Option<Box<serde_json::Value>>,
+ 
+     /// Framework-owned link to the prefill worker's span (cross-process
+     /// trace linking on disagg requests). Set by the framework on the
+@@ -270,7 +270,7 @@ pub struct LLMEngineOutput {
+ 
+     /// Additional arguments for extensibility
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub extra_args: Option<serde_json::Value>,
++    pub extra_args: Option<Box<serde_json::Value>>,
+ 
+     // Token usage information
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+@@ -279,7 +279,7 @@ pub struct LLMEngineOutput {
+     /// Opaque engine data passed through from the backend worker to the response.
+     /// Dynamo does not inspect this field; it is serialized as-is into `nvext.engine_data`.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub engine_data: Option<serde_json::Value>,
++    pub engine_data: Option<Box<serde_json::Value>>,
+ 
+     /// Router-computed data handed back to the frontend (e.g. standalone-router timing).
+     /// Dynamo-internal; consumed by the frontend. See [`RoutingData`](crate::protocols::common::timing::RoutingData).
+@@ -290,7 +290,7 @@ pub struct LLMEngineOutput {
+     /// it; `Backend` populates it after worker deserialization. The legacy optional-string
+     /// wire shape is retained, while pending token IDs are kept in memory only.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub jailed_text: Option<DecoderCheckpoint>,
++    pub jailed_text: Option<Box<DecoderCheckpoint>>,
+ }
+ 
+ impl LLMEngineOutput {
+@@ -418,7 +418,7 @@ impl LLMEngineOutput {
+             stop_reason: None,
+             index: Some(0),
+             disaggregated_params: None,
+-            encoder_result: Some(serde_json::Value::Object(encoder_result)),
++            encoder_result: Some(Box::new(serde_json::Value::Object(encoder_result))),
+             worker_trace_link: None,
+             extra_args: None,
+             completion_usage: None,
+@@ -486,7 +486,7 @@ mod tests {
+             worker_trace_link: None,
+             engine_data: None,
+             routing_data: None,
+-            jailed_text: checkpoint,
++            jailed_text: checkpoint.map(Box::new),
+         }
+     }
+ 
+@@ -511,7 +511,7 @@ mod tests {
+         );
+         let decoded_legacy: BackendOutput = serde_json::from_value(legacy).unwrap();
+         let checkpoint = decoded_legacy.jailed_text.unwrap();
+-        assert_eq!(&*checkpoint, "ST");
++        assert_eq!(&**checkpoint, "ST");
+         assert!(checkpoint.into_parts().1.is_empty());
+ 
+         let populated = serde_json::to_value(checkpoint_output(Some(DecoderCheckpoint::new(
+@@ -559,10 +559,59 @@ mod tests {
+             .as_ref()
+             .expect("encoder_result must be set");
+         assert!(result.is_object(), "encoder_result must be a JSON object");
+-        assert_eq!(result, &payload);
++        assert_eq!(&**result, &payload);
+         // Sibling Option fields stay None on the producer terminal.
+         assert!(chunk.disaggregated_params.is_none());
+         assert!(chunk.worker_trace_link.is_none());
+         assert!(chunk.completion_usage.is_none());
+     }
++
++    /// The rarely-set payload fields are boxed to keep the per-token item small (it is
++    /// moved through every response stream layer). `Box` must stay invisible on the wire:
++    /// JSON and named msgpack keep the unboxed shape and round-trip unchanged.
++    #[test]
++    fn boxed_payload_fields_keep_wire_shape() {
++        let output = LLMEngineOutput {
++            token_ids: vec![7],
++            disaggregated_params: Some(Box::new(serde_json::json!({"bootstrap_room": 42}))),
++            encoder_result: Some(Box::new(serde_json::json!({"embedding_handle": "h"}))),
++            extra_args: Some(Box::new(serde_json::json!({"k": [1, 2]}))),
++            engine_data: Some(Box::new(serde_json::json!({"sglang_response": {"id": "r"}}))),
++            jailed_text: Some(Box::new(DecoderCheckpoint::new("ST".to_string(), vec![195]))),
++            ..Default::default()
++        };
++
++        let json = serde_json::to_value(&output).unwrap();
++        assert_eq!(json["disaggregated_params"], serde_json::json!({"bootstrap_room": 42}));
++        assert_eq!(json["encoder_result"], serde_json::json!({"embedding_handle": "h"}));
++        assert_eq!(json["extra_args"], serde_json::json!({"k": [1, 2]}));
++        assert_eq!(json["engine_data"], serde_json::json!({"sglang_response": {"id": "r"}}));
++        assert_eq!(json["jailed_text"], "ST");
++
++        let mut expected = output.clone();
++        // Pending decoder IDs are in-process only and are not serialized.
++        expected.jailed_text = Some(Box::new(DecoderCheckpoint::new("ST".to_string(), vec![])));
++        let from_json: LLMEngineOutput = serde_json::from_value(json).unwrap();
++        assert_eq!(from_json, expected);
++        let packed = rmp_serde::to_vec_named(&output).unwrap();
++        let from_msgpack: LLMEngineOutput = rmp_serde::from_slice(&packed).unwrap();
++        assert_eq!(from_msgpack, expected);
++
++        let backend = BackendOutput {
++            disaggregated_params: output.disaggregated_params.clone(),
++            encoder_result: output.encoder_result.clone(),
++            engine_data: output.engine_data.clone(),
++            ..checkpoint_output(None)
++        };
++        let json = serde_json::to_value(&backend).unwrap();
++        assert_eq!(json["disaggregated_params"], serde_json::json!({"bootstrap_room": 42}));
++        assert_eq!(json["engine_data"], serde_json::json!({"sglang_response": {"id": "r"}}));
++        let packed = rmp_serde::to_vec_named(&backend).unwrap();
++        let from_msgpack: BackendOutput = rmp_serde::from_slice(&packed).unwrap();
++        assert_eq!(from_msgpack, backend);
++
++        // Size guard for the per-token item (592 and 488 bytes before boxing).
++        assert!(std::mem::size_of::<LLMEngineOutput>() <= 320);
++        assert!(std::mem::size_of::<BackendOutput>() <= 280);
++    }
+ }
+diff --git a/lib/llm/src/protocols/openai/chat_completions/delta.rs b/lib/llm/src/protocols/openai/chat_completions/delta.rs
+index 613a6ba..034f9de 100644
+--- a/lib/llm/src/protocols/openai/chat_completions/delta.rs
++++ b/lib/llm/src/protocols/openai/chat_completions/delta.rs
+@@ -306,7 +306,7 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
+             && (include_root_prompt_logprobs || include_nvext_prompt_logprobs)
+         {
+             self.prompt_logprobs =
+-                common::llm_backend::prompt_logprobs_from_engine_data(delta.engine_data.as_ref())?;
++                common::llm_backend::prompt_logprobs_from_engine_data(delta.engine_data.as_deref())?;
+         }
+         let prompt_logprobs_payload = finish_reason
+             .is_some()
+@@ -332,7 +332,7 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
+                 .build_response_nvext(NvExtResponseInput {
+                     tracker: Some(self.state.tracker_ref()),
+                     finish_reason: delta.finish_reason.as_ref(),
+-                    engine_data: delta.engine_data,
++                    engine_data: delta.engine_data.map(|boxed| *boxed),
+                     stop_reason,
+                     completion_token_ids: Some(completion_token_ids_slice),
+                     prompt_logprobs: nvext_prompt_logprobs,
+@@ -486,9 +486,9 @@ mod tests {
+             disaggregated_params: None,
+             worker_trace_link: None,
+             // routed_experts rides the engine's opaque passthrough.
+-            engine_data: Some(serde_json::json!({
++            engine_data: Some(Box::new(serde_json::json!({
+                 "routed_experts": {"layer_0": [1, 3]}
+-            })),
++            }))),
+             encoder_result: None,
+             routing_data: None,
+             jailed_text: None,
+@@ -811,11 +811,11 @@ mod tests {
+             disaggregated_params: None,
+             encoder_result: None,
+             worker_trace_link: None,
+-            engine_data: Some(serde_json::json!({
++            engine_data: Some(Box::new(serde_json::json!({
+                 "kv_transfer_time_ms": 12.3,
+                 "disaggregated_kv_transfer_time_ms": 8.1,
+                 "prefill_compute_time_ms": 45.6
+-            })),
++            }))),
+             routing_data: None,
+             jailed_text: None,
+         }
+@@ -870,9 +870,9 @@ mod tests {
+ 
+             let mut partial_output = final_backend_output();
+             partial_output.finish_reason = None;
+-            partial_output.engine_data = Some(serde_json::json!({
++            partial_output.engine_data = Some(Box::new(serde_json::json!({
+                 "prompt_logprobs": expected.clone()
+-            }));
++            })));
+             let partial_response = generator
+                 .choice_from_postprocessor(partial_output)
+                 .expect("partial choice generation");
+@@ -936,7 +936,7 @@ mod tests {
+         assert!(absent.prompt_logprobs.is_none());
+ 
+         let mut invalid_output = final_backend_output();
+-        invalid_output.engine_data = Some(serde_json::json!({"prompt_logprobs": "invalid"}));
++        invalid_output.engine_data = Some(Box::new(serde_json::json!({"prompt_logprobs": "invalid"})));
+         let error = request
+             .response_generator("req-prompt-logprobs-invalid".to_string())
+             .choice_from_postprocessor(invalid_output)
+diff --git a/lib/llm/src/protocols/openai/completions/delta.rs b/lib/llm/src/protocols/openai/completions/delta.rs
+index e0e2fd4..511ceb5 100644
+--- a/lib/llm/src/protocols/openai/completions/delta.rs
++++ b/lib/llm/src/protocols/openai/completions/delta.rs
+@@ -252,7 +252,7 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateCompletionResponse> for
+         // completions delta generators go through the same helper so the gating
+         // rules stay in one place.
+         let prompt_logprobs_payload = if self.state.options().response_fields.prompt_logprobs {
+-            common::llm_backend::prompt_logprobs_from_engine_data(delta.engine_data.as_ref())?
++            common::llm_backend::prompt_logprobs_from_engine_data(delta.engine_data.as_deref())?
+         } else {
+             None
+         };
+@@ -263,7 +263,7 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateCompletionResponse> for
+                 .build_response_nvext(NvExtResponseInput {
+                     tracker: Some(self.state.tracker_ref()),
+                     finish_reason: delta.finish_reason.as_ref(),
+-                    engine_data: delta.engine_data,
++                    engine_data: delta.engine_data.map(|boxed| *boxed),
+                     stop_reason,
+                     completion_token_ids: completion_token_ids_for_nvext.as_deref(),
+                     prompt_logprobs: prompt_logprobs_payload,
+@@ -368,9 +368,9 @@ mod tests {
+             disaggregated_params: None,
+             worker_trace_link: None,
+             // routed_experts rides the engine's opaque passthrough.
+-            engine_data: Some(serde_json::json!({
++            engine_data: Some(Box::new(serde_json::json!({
+                 "routed_experts": {"layer_0": [1, 3]}
+-            })),
++            }))),
+             encoder_result: None,
+             routing_data: None,
+             jailed_text: None,
+@@ -427,11 +427,11 @@ mod tests {
+             disaggregated_params: None,
+             encoder_result: None,
+             worker_trace_link: None,
+-            engine_data: Some(serde_json::json!({
++            engine_data: Some(Box::new(serde_json::json!({
+                 "kv_transfer_time_ms": 12.3,
+                 "disaggregated_kv_transfer_time_ms": 8.1,
+                 "prefill_compute_time_ms": 45.6
+-            })),
++            }))),
+             routing_data: None,
+             jailed_text: None,
+         }
+@@ -455,7 +455,7 @@ mod tests {
+     #[test]
+     fn test_malformed_prompt_logprobs_errors_only_when_requested() {
+         let mut invalid_output = final_backend_output();
+-        invalid_output.engine_data = Some(serde_json::json!({"prompt_logprobs": "invalid"}));
++        invalid_output.engine_data = Some(Box::new(serde_json::json!({"prompt_logprobs": "invalid"})));
+ 
+         create_test_request()
+             .response_generator("req-prompt-logprobs-unrequested".to_string())
+diff --git a/lib/llm/src/protocols/openai/generate.rs b/lib/llm/src/protocols/openai/generate.rs
+index fcb1ed6..def8689 100644
+--- a/lib/llm/src/protocols/openai/generate.rs
++++ b/lib/llm/src/protocols/openai/generate.rs
+@@ -684,7 +684,7 @@ impl GenerateAggregator {
+             && output.finish_reason.is_some()
+             && output.disaggregated_params.is_some()
+         {
+-            self.kv_transfer_params = output.disaggregated_params.clone();
++            self.kv_transfer_params = output.disaggregated_params.as_deref().cloned();
+         }
+         let index = output.index.unwrap_or(0);
+         let choice = self.choices.entry(index).or_insert(GenerateChoiceAcc {
+@@ -1197,7 +1197,7 @@ mod tests {
+                         bytes: None,
+                     },
+                 ]]),
+-                engine_data: Some(json!({
++                engine_data: Some(Box::new(json!({
+                     "prompt_logprobs": [
+                         null,
+                         {
+@@ -1208,7 +1208,7 @@ mod tests {
+                             }
+                         }
+                     ]
+-                })),
++                }))),
+                 ..Default::default()
+             },
+             LLMEngineOutput {
+@@ -1225,11 +1225,11 @@ mod tests {
+                     },
+                 ]]),
+                 finish_reason: Some(crate::protocols::common::FinishReason::Length),
+-                engine_data: Some(json!({
++                engine_data: Some(Box::new(json!({
+                     "routed_experts": "encoded-experts",
+                     "sampling_mask": [[7, 11], [13, 17, 19]],
+                     "kv_transfer_params": {"connector": "x"}
+-                })),
++                }))),
+                 ..Default::default()
+             },
+         ];
+@@ -1303,14 +1303,14 @@ mod tests {
+                 token_ids: vec![201],
+                 index: Some(1),
+                 finish_reason: Some(crate::protocols::common::FinishReason::Stop),
+-                engine_data: Some(json!({"routed_experts": "experts-1"})),
++                engine_data: Some(Box::new(json!({"routed_experts": "experts-1"}))),
+                 ..Default::default()
+             }),
+             Annotated::from_data(LLMEngineOutput {
+                 token_ids: vec![100],
+                 index: Some(0),
+                 finish_reason: Some(crate::protocols::common::FinishReason::Stop),
+-                engine_data: Some(json!({"routed_experts": "experts-0"})),
++                engine_data: Some(Box::new(json!({"routed_experts": "experts-0"}))),
+                 ..Default::default()
+             }),
+         ]);
+@@ -1343,7 +1343,7 @@ mod tests {
+             token_ids: vec![100],
+             index: Some(0),
+             finish_reason: Some(crate::protocols::common::FinishReason::Stop),
+-            engine_data: Some(json!({"routed_experts": payload})),
++            engine_data: Some(Box::new(json!({"routed_experts": payload}))),
+             ..Default::default()
+         })]);
+ 
+@@ -1369,14 +1369,14 @@ mod tests {
+             token_ids: vec![100],
+             index: Some(0),
+             finish_reason: Some(crate::protocols::common::FinishReason::Stop),
+-            engine_data: Some(json!({
++            engine_data: Some(Box::new(json!({
+                 "routed_experts": {
+                     "data": "AQI=",
+                     "shape": [3, 1, 1],
+                     "start": 0,
+                     "dtype": "uint8"
+                 }
+-            })),
++            }))),
+             ..Default::default()
+         })]);
+ 
+@@ -1394,7 +1394,7 @@ mod tests {
+             token_ids: vec![100],
+             index: Some(0),
+             finish_reason: Some(crate::protocols::common::FinishReason::Stop),
+-            engine_data: Some(json!({"routed_experts": {"unexpected": "object"}})),
++            engine_data: Some(Box::new(json!({"routed_experts": {"unexpected": "object"}}))),
+             ..Default::default()
+         })]);
+ 
+@@ -1415,7 +1415,7 @@ mod tests {
+             token_ids: vec![100],
+             index: Some(0),
+             finish_reason: Some(crate::protocols::common::FinishReason::Stop),
+-            engine_data: Some(json!({"sampling_mask": "invalid"})),
++            engine_data: Some(Box::new(json!({"sampling_mask": "invalid"}))),
+             ..Default::default()
+         })]);
+ 
+@@ -1436,7 +1436,7 @@ mod tests {
+             token_ids: vec![100],
+             index: Some(0),
+             finish_reason: Some(crate::protocols::common::FinishReason::Stop),
+-            engine_data: Some(json!({"sampling_mask": [[1], [2]]})),
++            engine_data: Some(Box::new(json!({"sampling_mask": [[1], [2]]}))),
+             ..Default::default()
+         })]);
+ 
+@@ -1453,7 +1453,7 @@ mod tests {
+             token_ids: vec![100],
+             index: Some(0),
+             finish_reason: Some(crate::protocols::common::FinishReason::Stop),
+-            disaggregated_params: Some(json!({"source": "terminal-fallback"})),
++            disaggregated_params: Some(Box::new(json!({"source": "terminal-fallback"}))),
+             ..Default::default()
+         })]);
+ 
+@@ -1473,15 +1473,15 @@ mod tests {
+             Annotated::from_data(LLMEngineOutput {
+                 token_ids: vec![100],
+                 index: Some(0),
+-                engine_data: Some(json!({
++                engine_data: Some(Box::new(json!({
+                     "kv_transfer_params": {"source": "engine-data"}
+-                })),
++                }))),
+                 ..Default::default()
+             }),
+             Annotated::from_data(LLMEngineOutput {
+                 index: Some(0),
+                 finish_reason: Some(crate::protocols::common::FinishReason::Stop),
+-                disaggregated_params: Some(json!({"source": "terminal-fallback"})),
++                disaggregated_params: Some(Box::new(json!({"source": "terminal-fallback"}))),
+                 ..Default::default()
+             }),
+         ]);
+@@ -1569,7 +1569,7 @@ mod tests {
+             token_ids: vec![100],
+             index: Some(0),
+             finish_reason: Some(crate::protocols::common::FinishReason::Length),
+-            engine_data: Some(json!({"prompt_logprobs": "invalid"})),
++            engine_data: Some(Box::new(json!({"prompt_logprobs": "invalid"}))),
+             ..Default::default()
+         })]);
+ 
+@@ -1646,7 +1646,7 @@ mod tests {
+         let stream = futures::stream::iter([Annotated::from_data(LLMEngineOutput {
+             token_ids: vec![100],
+             log_probs: Some(vec![-0.25, -0.5]),
+-            engine_data: Some(json!({"prompt_logprobs": "invalid"})),
++            engine_data: Some(Box::new(json!({"prompt_logprobs": "invalid"}))),
+             index: Some(0),
+             finish_reason: Some(crate::protocols::common::FinishReason::Length),
+             ..Default::default()
+@@ -1678,7 +1678,7 @@ mod tests {
+                     bytes: None,
+                 },
+             ]]),
+-            engine_data: Some(json!({
++            engine_data: Some(Box::new(json!({
+                 "prompt_logprobs": [
+                     null,
+                     {
+@@ -1689,7 +1689,7 @@ mod tests {
+                         }
+                     }
+                 ]
+-            })),
++            }))),
+             index: Some(0),
+             finish_reason: Some(crate::protocols::common::FinishReason::Length),
+             ..Default::default()
+diff --git a/lib/llm/src/protocols/sglang/stream.rs b/lib/llm/src/protocols/sglang/stream.rs
+index 6061b52..ce31ccd 100644
+--- a/lib/llm/src/protocols/sglang/stream.rs
++++ b/lib/llm/src/protocols/sglang/stream.rs
+@@ -62,9 +62,9 @@ mod tests {
+             token_ids: vec![101],
+             text: Some("a".to_string()),
+             index: Some(0),
+-            engine_data: Some(serde_json::json!({
++            engine_data: Some(Box::new(serde_json::json!({
+                 "sglang_response": native_response
+-            })),
++            }))),
+             ..Default::default()
+         })]);
+ 
+diff --git a/lib/mocker/servers/sglang/tests/sidecar.rs b/lib/mocker/servers/sglang/tests/sidecar.rs
+index b38e4b1..37667e7 100644
+--- a/lib/mocker/servers/sglang/tests/sidecar.rs
++++ b/lib/mocker/servers/sglang/tests/sidecar.rs
+@@ -218,7 +218,7 @@ async fn prefill_handoff_round_trips_through_a_decode_server() {
+ 
+     let mut decode_request = request(3);
+     decode_request.prefill_result = Some(PrefillResult {
+-        disaggregated_params: handoff,
++        disaggregated_params: *handoff,
+         prompt_tokens_details: None,
+     });
+     let decode_outputs = collect(&decode, decode_request).await;
+diff --git a/lib/mocker/servers/trtllm/tests/sidecar.rs b/lib/mocker/servers/trtllm/tests/sidecar.rs
+index 8b86e67..2170185 100644
+--- a/lib/mocker/servers/trtllm/tests/sidecar.rs
++++ b/lib/mocker/servers/trtllm/tests/sidecar.rs
+@@ -339,7 +339,7 @@ async fn prefill_handoff_round_trips_through_a_decode_server() {
+ 
+     let mut decode_request = request(3);
+     decode_request.prefill_result = Some(PrefillResult {
+-        disaggregated_params: handoff,
++        disaggregated_params: *handoff,
+         prompt_tokens_details: None,
+     });
+     let outputs = collect(&decode, decode_request).await;
+@@ -416,7 +416,7 @@ async fn decode_rejects_a_handoff_with_a_dropped_opaque_field() {
+ 
+     let mut decode_request = request(3);
+     decode_request.prefill_result = Some(PrefillResult {
+-        disaggregated_params: handoff,
++        disaggregated_params: *handoff,
+         prompt_tokens_details: None,
+     });
+     let context = dynamo_backend_common::testing::mock_context();
+diff --git a/lib/mocker/servers/vllm/tests/sidecar.rs b/lib/mocker/servers/vllm/tests/sidecar.rs
+index 0edbb5b..42961ea 100644
+--- a/lib/mocker/servers/vllm/tests/sidecar.rs
++++ b/lib/mocker/servers/vllm/tests/sidecar.rs
+@@ -178,7 +178,7 @@ async fn prefill_handoff_round_trips_through_a_decode_server() {
+ 
+     let mut decode_request = prefill_request;
+     decode_request.prefill_result = Some(PrefillResult {
+-        disaggregated_params: handoff,
++        disaggregated_params: *handoff,
+         prompt_tokens_details: None,
+     });
+     let decode_outputs = collect(&decode, decode_request).await;
+diff --git a/lib/sidecar/sglang/src/engine.rs b/lib/sidecar/sglang/src/engine.rs
+index f57ea54..0f31ada 100644
+--- a/lib/sidecar/sglang/src/engine.rs
++++ b/lib/sidecar/sglang/src/engine.rs
+@@ -413,7 +413,7 @@ impl LLMEngine for SglangSidecarEngine {
+                 // Publish the handoff only after the gRPC transport opens the
+                 // response stream so decode can rendezvous while prefill runs.
+                 yield Ok(LLMEngineOutput {
+-                    disaggregated_params: Some(handoff),
++                    disaggregated_params: Some(Box::new(handoff)),
+                     ..Default::default()
+                 });
+             }
+@@ -511,7 +511,7 @@ impl LLMEngine for SglangSidecarEngine {
+                             terminal.token_ids = token_ids;
+                             terminal.log_probs = log_probs;
+                             terminal.top_logprobs = top_logprobs;
+-                            terminal.engine_data = engine_data;
++                            terminal.engine_data = engine_data.map(Box::new);
+                             yield Ok(terminal);
+                             break;
+                         }
+@@ -528,7 +528,7 @@ impl LLMEngine for SglangSidecarEngine {
+                                 token_ids,
+                                 log_probs,
+                                 top_logprobs,
+-                                engine_data,
++                                engine_data: engine_data.map(Box::new),
+                                 ..Default::default()
+                             });
+                         }
+diff --git a/lib/sidecar/sglang/src/native_http.rs b/lib/sidecar/sglang/src/native_http.rs
+index 1583900..d496632 100644
+--- a/lib/sidecar/sglang/src/native_http.rs
++++ b/lib/sidecar/sglang/src/native_http.rs
+@@ -278,7 +278,7 @@ impl NativeHttp {
+                 // successful response headers so decode can rendezvous while
+                 // prefill runs.
+                 yield Ok(LLMEngineOutput {
+-                    disaggregated_params: Some(handoff),
++                    disaggregated_params: Some(Box::new(handoff)),
+                     ..Default::default()
+                 });
+             }
+@@ -402,9 +402,9 @@ fn output(response: Value, prefill_handoff: &mut Option<Value>) -> (LLMEngineOut
+         None if finished => LLMEngineOutput::stop(),
+         None => LLMEngineOutput::default(),
+     };
+-    output.engine_data = Some(serde_json::json!({"sglang_response": response}));
++    output.engine_data = Some(Box::new(serde_json::json!({"sglang_response": response})));
+     if finished {
+-        output.disaggregated_params = prefill_handoff.take();
++        output.disaggregated_params = prefill_handoff.take().map(Box::new);
+     }
+     (output, finished)
+ }
+@@ -769,7 +769,7 @@ mod tests {
+         let (converted, is_terminal) = output(chunk.clone(), &mut None);
+         assert!(!is_terminal);
+         assert_eq!(
+-            converted.engine_data,
++            converted.engine_data.as_deref().cloned(),
+             Some(json!({"sglang_response": chunk}))
+         );
+         assert!(converted.finish_reason.is_none());
+@@ -779,7 +779,7 @@ mod tests {
+         let (converted, is_terminal) = output(terminal.clone(), &mut None);
+         assert!(is_terminal);
+         assert_eq!(
+-            converted.engine_data,
++            converted.engine_data.as_deref().cloned(),
+             Some(json!({"sglang_response": terminal}))
+         );
+         assert_eq!(converted.finish_reason, Some(FinishReason::Stop));
+@@ -793,7 +793,7 @@ mod tests {
+             Some(FinishReason::Error("rejected".to_string()))
+         );
+         assert_eq!(
+-            converted.engine_data,
++            converted.engine_data.as_deref().cloned(),
+             Some(json!({"sglang_response": failure}))
+         );
+     }
+diff --git a/lib/sidecar/trtllm/src/convert.rs b/lib/sidecar/trtllm/src/convert.rs
+index fbf4bba..a99f5f1 100644
+--- a/lib/sidecar/trtllm/src/convert.rs
++++ b/lib/sidecar/trtllm/src/convert.rs
+@@ -584,7 +584,7 @@ impl ResponseState {
+             // which the frontend forwards to the decode leg and which cannot be
+             // reconstructed client-side.
+             completion_usage: Some(Box::new(prefill_usage(reported, self.prompt_tokens))),
+-            disaggregated_params: Some(disagg::session_to_json(session)?),
++            disaggregated_params: Some(Box::new(disagg::session_to_json(session)?)),
+             ..Default::default()
+         })
+     }
+diff --git a/lib/sidecar/trtllm/src/tests/disagg.rs b/lib/sidecar/trtllm/src/tests/disagg.rs
+index 3436c03..415c43f 100644
+--- a/lib/sidecar/trtllm/src/tests/disagg.rs
++++ b/lib/sidecar/trtllm/src/tests/disagg.rs
+@@ -120,7 +120,7 @@ async fn decode_request_replays_the_prefill_session() {
+     decode.start(0).await.expect("start decode");
+     let mut req = agent_request;
+     req.prefill_result = Some(dynamo_backend_common::PrefillResult {
+-        disaggregated_params: handoff,
++        disaggregated_params: *handoff,
+         prompt_tokens_details: None,
+     });
+     let outputs = collect(&decode, req).await;
+diff --git a/lib/sidecar/trtllm/src/tests/e2e.rs b/lib/sidecar/trtllm/src/tests/e2e.rs
+index 984391b..00f69b6 100644
+--- a/lib/sidecar/trtllm/src/tests/e2e.rs
++++ b/lib/sidecar/trtllm/src/tests/e2e.rs
+@@ -83,7 +83,7 @@ async fn e2e_real_disagg_handoff() {
+     // Phase 2: decode replays the handoff.
+     let mut decode_request = base();
+     decode_request.prefill_result = Some(dynamo_backend_common::PrefillResult {
+-        disaggregated_params: handoff,
++        disaggregated_params: *handoff,
+         prompt_tokens_details: None,
+     });
+     let decode_outputs = collect(&decode, decode_request).await;
+diff --git a/lib/sidecar/vllm/src/convert.rs b/lib/sidecar/vllm/src/convert.rs
+index 05bdd9d..ecb79e8 100644
+--- a/lib/sidecar/vllm/src/convert.rs
++++ b/lib/sidecar/vllm/src/convert.rs
+@@ -1459,7 +1459,8 @@ impl ResponseState {
+         mapped.disaggregated_params = finish
+             .kv_transfer_params
+             .map(|value| struct_to_json_v14(value, PEER, KV_TRANSFER_PARAMS))
+-            .transpose()?;
++            .transpose()?
++            .map(Box::new);
+         if self.mode.is_prefill() && mapped.disaggregated_params.is_none() {
+             return Err(client::protocol_error(
+                 "prefill terminal is missing kv_transfer_params",
+@@ -1473,7 +1474,7 @@ impl ResponseState {
+             })?;
+             let params = mapped
+                 .disaggregated_params
+-                .as_mut()
++                .as_deref_mut()
+                 .and_then(serde_json::Value::as_object_mut)
+                 .ok_or_else(|| {
+                     client::protocol_error("prefill kv_transfer_params is not a JSON object")
+@@ -1493,7 +1494,7 @@ impl ResponseState {
+ 
+     fn attach_prompt_data(&mut self, output: &mut LLMEngineOutput) {
+         if output.engine_data.is_none() {
+-            output.engine_data = self.prompt_info.take().map(prompt_logprobs_to_json);
++            output.engine_data = self.prompt_info.take().map(prompt_logprobs_to_json).map(Box::new);
+         }
+     }
+ 
+diff --git a/lib/sidecar/vllm/src/convert/response_tests.rs b/lib/sidecar/vllm/src/convert/response_tests.rs
+index 48012e7..4df4de1 100644
+--- a/lib/sidecar/vllm/src/convert/response_tests.rs
++++ b/lib/sidecar/vllm/src/convert/response_tests.rs
+@@ -101,7 +101,7 @@ fn early_prompt_frames_retain_exact_native_metadata() {
+             .num_output_tokens = 1 + u32::from(has_output);
+         let result = state.convert(response).unwrap().unwrap();
+         assert!(result.finish_reason.is_some());
+-        assert_eq!(result.engine_data, has_prompt_logprobs.then(|| json!({"prompt_logprobs": [null, {"22": {"logprob": -0.25, "rank": 1}, "23": {"logprob": -0.75, "rank": 2}}, {"33": {"logprob": -0.5, "rank": 2}}]})));
++        assert_eq!(result.engine_data.map(|boxed| *boxed), has_prompt_logprobs.then(|| json!({"prompt_logprobs": [null, {"22": {"logprob": -0.25, "rank": 1}, "23": {"logprob": -0.75, "rank": 2}}, {"33": {"logprob": -0.5, "rank": 2}}]})));
+     }
+ }
+ 
+@@ -352,7 +352,7 @@ fn prefill_handoff_is_required_only_for_successful_native_terminals() {
+                 assert_eq!(terminal.finish_reason, Some(FinishReason::Cancelled));
+                 assert!(terminal.disaggregated_params.is_none());
+                 assert_eq!(
+-                    terminal.engine_data,
++                    terminal.engine_data.as_deref().cloned(),
+                     Some(json!({"prompt_logprobs": [
+                         null,
+                         {"22": {"logprob": -0.25, "rank": 1}, "23": {"logprob": -0.75, "rank": 2}},
+@@ -373,7 +373,7 @@ fn prefill_handoff_is_required_only_for_successful_native_terminals() {
+                     );
+                 }
+             } else {
+-                assert_eq!(terminal.disaggregated_params, Some(handoff));
++                assert_eq!(terminal.disaggregated_params.as_deref().cloned(), Some(handoff));
+             }
+         }
+     }
+diff --git a/lib/sidecar/vllm/src/tests.rs b/lib/sidecar/vllm/src/tests.rs
+index 6da1b76..e49b889 100644
+--- a/lib/sidecar/vllm/src/tests.rs
++++ b/lib/sidecar/vllm/src/tests.rs
+@@ -1508,7 +1508,7 @@ async fn mixed_multimodal_media_is_forwarded_with_image_uuid_only() {
+ 
+     let mut decode_request = multimodal_request;
+     decode_request.prefill_result = Some(PrefillResult {
+-        disaggregated_params: handoff,
++        disaggregated_params: *handoff,
+         prompt_tokens_details: None,
+     });
+     let decode_outputs = collect(&decode, decode_request).await;
+@@ -1595,7 +1595,7 @@ async fn assert_encoder_cache_handoff(mut source_request: PreprocessedRequest) {
+         .encoder_result
+         .clone()
+         .expect("encoder result");
+-    assert_eq!(encoder_result, expected_ec);
++    assert_eq!(*encoder_result, expected_ec);
+     assert_eq!(
+         server
+             .service
+@@ -1633,7 +1633,7 @@ async fn assert_encoder_cache_handoff(mut source_request: PreprocessedRequest) {
+         let downstream = engine(&server.endpoint, mode, 1, discovered.clone());
+         downstream.start(1).await.expect("start downstream");
+         let mut downstream_request = source_request.clone();
+-        downstream_request.encoder_result = Some(encoder_result.clone());
++        downstream_request.encoder_result = Some((*encoder_result).clone());
+         let outputs = collect(&downstream, downstream_request.clone()).await;
+         if mode.is_prefill() {
+             assert!(outputs[0].token_ids.is_empty(), "{topology}");
+@@ -1674,7 +1674,7 @@ async fn assert_encoder_cache_handoff(mut source_request: PreprocessedRequest) {
+                 .expect("prefill KV object")
+                 .remove("_dynamo_sidecar_multimodal_prompt_token_ids");
+             decode_request.prefill_result = Some(PrefillResult {
+-                disaggregated_params,
++                disaggregated_params: *disaggregated_params,
+                 prompt_tokens_details: None,
+             });
+             let decode = engine(
+@@ -2496,7 +2496,7 @@ async fn prefill_decode_handoff_is_opaque_and_repeatable() {
+ 
+         let mut decode_request = request();
+         decode_request.prefill_result = Some(PrefillResult {
+-            disaggregated_params: handoff.clone(),
++            disaggregated_params: (*handoff).clone(),
+             prompt_tokens_details: None,
+         });
+         let decode_outputs = collect(&decode, decode_request).await;
+@@ -2515,7 +2515,7 @@ async fn prefill_decode_handoff_is_opaque_and_repeatable() {
+         // Struct number would reach the engine as `20097.0`).
+         let mut expected = handoff.clone();
+         expected["remote_port"] = json!("20097");
+-        assert_eq!(decoded, expected);
++        assert_eq!(decoded, *expected);
+     }
+ }
+ 
