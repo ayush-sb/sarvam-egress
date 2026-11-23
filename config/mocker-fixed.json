@@ -1,0 +1,13 @@
+{
+  "engine": {
+    "backend": "vllm",
+    "num_gpu_blocks": 65536,
+    "max_num_seqs": 100000,
+    "max_num_batched_tokens": 10000000,
+    "timing_model": {
+      "type": "fixed",
+      "prefill_ms": 0.1,
+      "decode_ms": 50.0
+    }
+  }
+}

@@ -1,102 +1,71 @@
-# Egress at Line Rate
+# Egress at Line Rate: mock mode
 
-This repository measures the per-token CPU cost of the NVIDIA Dynamo 1.6.2 frontend (the gateway between SGLang and
-the client) and holds a set of Dynamo changes that cut that cost. A benchmark compares three arms under the same load:
-SGLang's own HTTP server (no gateway), stock Dynamo and the optimized Dynamo frontend.
+This branch runs the frontend benchmark without a GPU. It compares stock Dynamo 1.6.2 with the optimized Dynamo
+frontend in front of Dynamo's mock engine. The `main` branch has the GPU benchmark with real SGLang.
+
+## What mock mode is
+
+- **The engine is Dynamo's own mock engine** (`dynamo.mocker`), not a GPU and not SGLang. It is part of Dynamo and is
+  written in Rust. There is no Python layer between the engine and the frontend: frames go from the mock engine's
+  Rust code to the frontend over Dynamo's TCP response plane.
+- **Fixed timing** (`config/mocker-fixed.json`): every stream gets one token every 50 ms, one token per SSE event.
+  At 2048 streams that is about 41000 events per second, so the frontend is busy. The engine needs one core.
+- **The client is a custom load generator** (`loadgen/`, Rust). It holds N streams open on keep-alive HTTP/1.1
+  connections, records the arrival time of every SSE event, and does no tokenization or JSON parsing, so its own
+  CPU cost stays small. Each request asks for 1024 ± 300 tokens with `ignore_eos`.
+- **The model** is only a name and a tokenizer (Qwen/Qwen3-0.6B). No weights are loaded.
+
+Mock mode measures the frontend when it is busy. On a single GPU with real SGLang, the frontend gets about 9000
+events per second and is mostly idle, so the results differ (see the report).
 
 ## Requirements
 
-- One NVIDIA Blackwell GPU (tested on an RTX PRO 6000 Blackwell, 96 GB). The default model uses FP8 weights with an
-  NVFP4 KV cache, which needs Blackwell.
-- Ubuntu 24.04, sudo, and about 150 GB of free disk.
-- At least 9 physical CPU cores on one NUMA node (tested on 32 vCPUs).
+- Linux x86-64 with at least 6 physical cores on one NUMA node (tested on an i7-9750H laptop). No GPU.
+- Ubuntu 24.04, sudo, and about 20 GB of free disk.
 
 ## Set up and run
 
 ```
-git clone --recurse-submodules https://github.com/ayush-sb/sarvam-egress.git && cd sarvam-egress
-./setup.sh                      # 5-10 min: downloads the published builds and the model
-sudo ./bench-mode.sh on         # keeps other work off the measured cores
-./bench.sh --quick --rounds 3   # 2048 streams, about 1 h
-sudo ./bench-mode.sh off        # when finished (a reboot also does this)
+git clone --recurse-submodules -b mock-mode https://github.com/ayush-sb/sarvam-egress.git && cd sarvam-egress
+./setup.sh --mock                      # about 5 min: published builds, tokenizer, load generator
+sudo ./bench-mode.sh on                # keeps other work off the measured cores
+./bench.sh --mock --quick --rounds 3   # 2048 streams, three CPU windows per arm
+./bench.sh --mock --rounds 3           # 256, 512, 1024 and 2048 streams
+sudo ./bench-mode.sh off               # when finished (a reboot also does this)
 ```
 
-| Command | What it runs |
-|---|---|
-| `./bench.sh --quick --rounds 3` | 2048 streams, three CPU windows per arm (recommended) |
-| `./bench.sh --rounds 3` | 256, 512, 1024 and 2048 streams, three CPU windows per arm (about 2.5 h) |
-| `./bench.sh --levels "512 2048"` | Other levels (2048 is required) |
-| `./bench.sh --resume results/bench-<time>` | Continue a stopped run |
-| `./setup.sh --from-source` | Build both Dynamo libraries on this machine, with PGO training (about 45 min) |
-
-Each run writes `results/bench-<time>/table.md`. It has every measure per level and arm, links to one flame graph
-per arm and level, and the run settings. Setup output goes to `build/setup.log`.
+`./bench.sh --mock --resume results/bench-<time>` continues a stopped run. Each run writes
+`results/bench-<time>/table.md`.
 
 ## Cores
 
-`setup.sh` writes `config/cpus.local.sh` for the machine (`scripts/detect-cpus.py`). The default layout uses one NUMA
-node: frontend 3 cores, SGLang worker 4 cores, benchmark client 2 cores, and all other CPUs for the system. The SMT
-siblings of the frontend and worker cores go offline in benchmark mode.
-
-To change the layout, write the file again and restart benchmark mode:
+`setup.sh --mock` writes `config/cpus.local.sh`: frontend 3 cores, mock engine 1 core, load generator 2 cores (1 on a
+6-core machine; it may use both SMT threads), and the rest for the system. To change it:
 
 ```
 sudo ./bench-mode.sh off
-scripts/detect-cpus.py --frontend 2 --worker 4 --client 2
+scripts/detect-cpus.py --frontend 3 --worker 1 --client 2
 sudo ./bench-mode.sh on
 ```
 
-Benchmark mode reads the same file, so change the layout this way and not with environment variables. Stock Dynamo
-starts one Tokio worker per allowed core, so the number of frontend cores also sets the number of Tokio workers for
-stock.
+Stock Dynamo starts one Tokio worker per allowed core, so it runs three on three frontend cores.
 
-## Method
+## What it measures
 
-- The two Dynamo arms share one SGLang worker and alternate in 20 s windows at a steady load.
-- CPU windows run without a profiler or a capture. Flame graphs, syscall counts and latency come from separate
-  windows.
-- The token rates of a stock and optimized pair must match within 5% (10% in instrumented windows). A rejected window
-  or pair is measured again, up to three times.
-- CPU results are medians of the CPU windows.
-- Gateway CPU is the user and system time of the frontend process (for SGLang alone, its HTTP server). Client p99 is
-  the gap between SSE events. Emit-to-wire runs from the engine step of a token to the tcpdump capture of its SSE
-  event.
+- Two arms, stock and optimized, share one mock engine and alternate in 20 s windows.
+- CPU windows run without a profiler or a capture. A flame graph and the syscall counts come from separate windows.
+- The token rates of a pair must match within 5% (10% in instrumented windows). A rejected window or pair is
+  measured again, up to three times. CPU results are medians of the CPU windows.
+- Gateway CPU is the user and system time of the frontend process. Client p99 is the gap between consecutive SSE
+  events of a stream, from the load generator's arrival times.
+- Not measured in mock mode: emit-to-wire latency (the mock engine has no emit timestamps), and SGLang alone (the
+  mock engine has no HTTP server of its own).
 
 ## The optimized frontend
 
-- `patches/optimized/`: the Dynamo changes, applied in the order of `series` to the pinned Dynamo commit
-  (`dynamo/`, v1.6.2).
-- `config/optimized.env`: the settings for the optimized arm. Each line has a comment. Remove a line to turn that
-  setting off. The settings take effect when the frontend restarts.
-- Field boxing and the ThinLTO + PGO build are part of the optimized library. The stock library has neither.
-- `patches/instrumentation/`: timestamps for the latency measurements, in Dynamo's SGLang worker and in SGLang's output
-  streamer (the engine step). They are active only in latency windows.
+The optimized arm uses the patches in `patches/optimized/` and the settings in `config/optimized.env`, with one
+change: mock mode runs it with two Tokio workers (`OPTIMIZED_WORKER_THREADS` in `config/mock.env`). The cloud preset
+uses one worker at about 9000 events per second. At 41000 events per second, one worker raises client p99.
 
-## Build from source
-
-`./setup.sh` downloads the published builds. `./setup.sh --from-source` builds both Dynamo libraries on the machine
-instead (about 45 min on the cloud machine). It needs the GPU, because PGO training serves the model. The steps:
-
-1. `scripts/build-dynamo.sh vanilla`: stock Dynamo 1.6.2 at the pinned commit, with Dynamo's own build settings.
-2. `scripts/build-dynamo.sh train`: the optimized source (`patches/optimized/` in `series` order) with ThinLTO,
-   instrumented for PGO.
-3. `scripts/train-pgo.sh`: SGLang serves the model, the instrumented frontend runs with `config/optimized.env`, and
-   SGLang's benchmark client sends 512 and then 2048 streams. The profiles merge into `build/pgo/merged.profdata`.
-4. `scripts/build-dynamo.sh optimized`: the optimized library, with ThinLTO and PGO.
-5. `scripts/stage-builds.sh`: lays out `build/` for the benchmark and checks that both libraries import.
-
-Each library builds in a git worktree of `dynamo/` under `build/src/`, so `dynamo/` itself does not change. Compiler
-output goes to `build/build-<variant>.log`. `build/provenance.txt` says whether the libraries were downloaded or built.
-
-After a change to `patches/optimized/`, delete `build/src/optimized` and `build/pgo`, then run
-`./setup.sh --from-source` again. The patches go on again, and a new PGO profile is trained for the new code.
-
-## Layout
-
-| Path | Contents |
-|---|---|
-| `setup.sh`, `bench.sh`, `bench-mode.sh` | Setup, the benchmark and benchmark mode |
-| `scripts/` | The sweep, measurement, checks, analysis, build and PGO training |
-| `config/` | Model, release, optimized preset, pinned SGLang packages and the prompt set |
-| `patches/` | Dynamo changes and instrumentation |
-| `tests/` | Tests for the checks and the analysis |
+The published optimized build was trained (PGO) on SGLang traffic on the cloud machine. A build trained on mock
+traffic gives somewhat different numbers.

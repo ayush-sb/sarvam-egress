@@ -12,6 +12,9 @@
 # The same OUTPUT_DIR again resumes. For testing on a small GPU: CHECKS=0 skips the checks and benchmark
 # mode, and WINDOW, OUTPUT_TOKENS, OUTPUT_TOKENS_LOW, PROMPTS_PER_STREAM, SETTLE_SECONDS,
 # CLIENT_WARMUP_REQUESTS and RUN_TIMEOUT change the workload.
+#
+# MOCK=1 (bench.sh --mock): Dynamo's mock engine (MOCKER_CONFIG) in place of SGLang, the Rust load generator as
+# the client, and only the two gateway arms (cpu, profile and syscalls windows; no latency windows).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 out=$(realpath -m "${1:?usage: scripts/sweep.sh OUTPUT_DIR}")
@@ -19,7 +22,7 @@ out=$(realpath -m "${1:?usage: scripts/sweep.sh OUTPUT_DIR}")
 source scripts/env.sh
 builds=$(realpath "$BUILD_DIR")
 export MODEL_PATH=$(realpath "$MODEL_PATH") SHAREGPT_DATASET=${SHAREGPT_DATASET:-$ROOT/config/workload/sharegpt-short.json}
-checks=${CHECKS:-1}
+checks=${CHECKS:-1} mock=${MOCK:-0}
 say() { printf '%s  %s\n' "$(date +%T)" "$*"; }
 die() { say "STOPPED: $*" >&2; exit 1; }
 
@@ -28,6 +31,10 @@ die() { say "STOPPED: $*" >&2; exit 1; }
 levels=${LEVELS:-256 512 1024 2048} rounds=${RUNS:-3}
 latency_rounds=${LATENCY_RUNS:-1} latency_rounds_2048=${LATENCY_RUNS_2048:-2}
 waves=${PROMPTS_PER_STREAM:-1} output_low=${OUTPUT_TOKENS_LOW:-1536} run_timeout=${RUN_TIMEOUT:-600}
+if [[ $mock == 1 ]]; then   # the load generator runs for a fixed time: one output length at every level
+    : "${MOCKER_CONFIG:?}"; export MOCKER_CONFIG=$(realpath "$MOCKER_CONFIG") OUTPUT_SPREAD=${OUTPUT_SPREAD:-300}
+    OUTPUT_TOKENS=${OUTPUT_TOKENS:-1024}; output_low=$OUTPUT_TOKENS latency_rounds=0 latency_rounds_2048=0
+fi
 export WINDOW=${WINDOW:-20} OUTPUT_TOKENS=${OUTPUT_TOKENS:-512} SETTLE_SECONDS=${SETTLE_SECONDS:-3}
 export CLIENT_WARMUP_REQUESTS=${CLIENT_WARMUP_REQUESTS:-16}
 levels=$(printf '%s\n' $levels | sort -n | uniq | paste -sd' ')
@@ -39,7 +46,7 @@ latency_rounds_for() { if (($1 == 2048)); then echo "$latency_rounds_2048"; else
 while read -r name; do unset "$name"; done < <(compgen -e | awk '/^(DYN_|SARVAM_STEP_TRACE)/')
 unset FRONTEND_ENV GATEWAY_PYTHONPATH WORKER_PYTHONPATH LD_PRELOAD BENCH_PROMPTS
 source scripts/env.sh
-export HF_HUB_OFFLINE=1 CHECKS=$checks
+export HF_HUB_OFFLINE=1 CHECKS=$checks MOCK=$mock
 export SGLANG_WORKER_ARGS=${SGLANG_WORKER_ARGS---freeze-gc-after-init}     # GC pauses in the worker stall delivery
 # Engine settings the runner owns: room for every stream, one token per chunk, no prefix-cache hits
 # between arms, prefill CUDA graphs off as in Dynamo's worker launcher.
@@ -63,17 +70,27 @@ fi
 (cd "$builds" && sha256sum --quiet -c binaries.sha256) || die "a library in $builds changed since setup"
 jemalloc=$(ldconfig -p | awk '/libjemalloc\.so\.2 .*x86-64/ && !found {print $NF; found=1}')
 BUNDLE_JEMALLOC=$jemalloc; source config/optimized.env; optimized_env=$FRONTEND_ENV
+if [[ $mock == 1 ]]; then     # the mock engine's event rate needs more Tokio workers than the cloud preset
+    optimized_env=$(sed -E "s/DYN_RUNTIME_NUM_WORKER_THREADS=[0-9]+/DYN_RUNTIME_NUM_WORKER_THREADS=${OPTIMIZED_WORKER_THREADS:-2}/" <<< "$optimized_env")
+fi
 
 # The settings of this run, kept with the results (table.md prints them). A resumed run must match.
 {
     printf '%s\n' "model=$MODEL" "levels=$levels" "rounds=$rounds" "latency_rounds=$latency_rounds" \
-        "latency_rounds_2048=$latency_rounds_2048" "window=$WINDOW" "output_tokens=$OUTPUT_TOKENS" \
-        "output_tokens_low=$output_low" "prompts_per_stream=$waves" "sglang_args=$SGLANG_ARGS" \
-        "sglang_worker_args=$SGLANG_WORKER_ARGS" "request_body=$SG_BENCH_REQUEST_BODY" "optimized_env=$optimized_env" \
+        "latency_rounds_2048=$latency_rounds_2048" "window=$WINDOW" "output_tokens=$OUTPUT_TOKENS"
+    if [[ $mock == 1 ]]; then
+        printf '%s\n' "engine=Dynamo mock engine, $(jq -c . "$MOCKER_CONFIG")" "client=loadgen" \
+            "output_tokens_spread=$OUTPUT_SPREAD"
+    else
+        printf '%s\n' "output_tokens_low=$output_low" "prompts_per_stream=$waves" "sglang_args=$SGLANG_ARGS" \
+            "sglang_worker_args=$SGLANG_WORKER_ARGS" "request_body=$SG_BENCH_REQUEST_BODY"
+    fi
+    printf '%s\n' "optimized_env=$optimized_env" \
         "frontend_cpus=$FRONTEND_CPUS" "worker_cpus=$WORKER_CPUS" "client_cpus=$CLIENT_CPUS" \
         "housekeeping_cpus=$HOUSEKEEPING_CPUS" "host=$(hostname)" "kernel=$(uname -r)" "checks=$checks"
     sed 's/^/builds: /' "$builds/provenance.txt" 2>/dev/null || true
-    nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+    if [[ $mock == 1 ]]; then lscpu | awk -F': *' '/^Model name/ {print "cpu: " $2}'
+    else nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader; fi
 } > "$out/config.pending"
 if [[ -e $out/config.txt ]]; then
     cmp -s "$out/config.txt" "$out/config.pending" || die "settings differ from the run in $out; use a new output directory"
@@ -110,10 +127,11 @@ run() {   # LEVEL MODE ROUND, for the arm chosen by set_arm
 
 set_arm() {
     VARIANT=$1 FRONTEND_ENV= GATEWAY_PYTHONPATH= WORKER_PYTHONPATH=$builds/worker
+    local engine=sglang; [[ $mock == 0 ]] || engine=mocker
     case $VARIANT in
         no-gateway) ENGINE=sglang-direct ;;
-        default-gateway) ENGINE=sglang GATEWAY_PYTHONPATH=$builds/pristine ;;
-        optimized-gateway) ENGINE=sglang GATEWAY_PYTHONPATH=$builds/optimized FRONTEND_ENV=$optimized_env ;;
+        default-gateway) ENGINE=$engine GATEWAY_PYTHONPATH=$builds/pristine ;;
+        optimized-gateway) ENGINE=$engine GATEWAY_PYTHONPATH=$builds/optimized FRONTEND_ENV=$optimized_env ;;
     esac
     export VARIANT ENGINE FRONTEND_ENV GATEWAY_PYTHONPATH WORKER_PYTHONPATH
 }
@@ -130,7 +148,7 @@ gateway_pair() {   # LEVEL MODE ROUND: both gateway arms on the same worker, the
     if ! python3 scripts/checks.py pair --rate-tolerance "$tolerance" "$a" "$b" > "$out/pair-c$c-$mode-r$repeat.json"; then
         say "REJECTED pair: $(jq -r '.errors | join("; ")' "$out/pair-c$c-$mode-r$repeat.json")"; unpair; return 1
     fi
-    if [[ $mode == cpu ]]; then
+    if [[ $mode == cpu && $mock == 0 ]]; then
         for arm in default-gateway optimized-gateway; do
             if ! python3 scripts/checks.py pair --direct "$out/no-gateway-c$c-cpu-r$repeat" "$out/$arm-c$c-cpu-r$repeat" \
                 > "$out/direct-vs-$arm-c$c-r$repeat.json"; then
@@ -150,16 +168,18 @@ attempts() {   # COMMAND...: a failed or rejected window (or pair) is measured a
 }
 
 say "levels: $levels; $rounds cpu round(s) per arm and level; output: $out"
-set_arm no-gateway
-services=$out/services/no-gateway-measurement
-for c in $sweep_order; do
-    for ((r = 1; r <= rounds; r++)); do attempts run "$c" cpu "$r"; done
-    attempts run "$c" profile 1; attempts run "$c" syscalls 1
-done
-stop_services
-services=$out/services/no-gateway-latency
-for c in $sweep_order; do for ((r = 1; r <= $(latency_rounds_for "$c"); r++)); do attempts run "$c" latency "$r"; done; done
-stop_services
+if [[ $mock == 0 ]]; then     # the mock engine has no server of its own: no SGLang-alone arm
+    set_arm no-gateway
+    services=$out/services/no-gateway-measurement
+    for c in $sweep_order; do
+        for ((r = 1; r <= rounds; r++)); do attempts run "$c" cpu "$r"; done
+        attempts run "$c" profile 1; attempts run "$c" syscalls 1
+    done
+    stop_services
+    services=$out/services/no-gateway-latency
+    for c in $sweep_order; do for ((r = 1; r <= $(latency_rounds_for "$c"); r++)); do attempts run "$c" latency "$r"; done; done
+    stop_services
+fi
 services=$out/services/gateway-measurement
 for c in $sweep_order; do
     for ((r = 1; r <= rounds; r++)); do attempts gateway_pair "$c" cpu "$r"; done

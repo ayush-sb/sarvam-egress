@@ -97,8 +97,9 @@ def window(path, count, mode, expected_seconds):
     if len(rates) < 2 or min(rates) < .75 * tps:
         errors.append("decode delivery stalled or fell below 75% of the window rate")
 
+    mock = summary.get("engine") == "mocker"     # Dynamo's mock engine: no SGLang log lines, no prompt set
     engine = summary.get("engine_log") or {}
-    if engine.get("decode_log_lines", 0) < 2 or (engine.get("running_req_min") or 0) < minimum:
+    if not mock and (engine.get("decode_log_lines", 0) < 2 or (engine.get("running_req_min") or 0) < minimum):
         errors.append(f"worker logs do not establish {minimum} sustained decoding requests")
     lifecycle = path / "worker-after-launch.log"
     worker = lifecycle.read_text(errors="replace")
@@ -109,7 +110,7 @@ def window(path, count, mode, expected_seconds):
     arrivals = client.get("window") or {}
     if client.get("errors_or_incomplete", 1) or not (arrivals.get("chunk_gap_ms") or {}).get("p99"):
         errors.append("client errors or missing in-window inter-token measurements")
-    if client.get("requests") != int((path / "expected-prompts.txt").read_text()):
+    if not mock and client.get("requests") != int((path / "expected-prompts.txt").read_text()):
         errors.append("official client did not finish the full fixed prompt set")
     grouping = summary.get("tokens_per_event") or 0
     if grouping > 1.20 and summary.get("engine") != "sglang-direct":

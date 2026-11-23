@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # One measured window at one concurrency level (sweep.sh calls it).
 #
-#   ENGINE=sglang|sglang-direct VARIANT=NAME MODE=cpu|profile|syscalls|latency CONCURRENCY=N \
+#   ENGINE=sglang|sglang-direct|mocker VARIANT=NAME MODE=cpu|profile|syscalls|latency CONCURRENCY=N \
 #       MEASURE_DIR=DIR scripts/measure.sh
 #
 # ENGINE=sglang: the Dynamo frontend (GATEWAY_PYTHONPATH, FRONTEND_ENV) in front of Dynamo's SGLang worker
 # (WORKER_PYTHONPATH). The worker keeps running when only the frontend changes, so the gateway arms share it.
 # ENGINE=sglang-direct: SGLang's own HTTP server, no gateway.
+# ENGINE=mocker: the Dynamo frontend in front of Dynamo's mock engine (MOCKER_CONFIG), with the Rust load
+# generator in loadgen/ as the client (OUTPUT_TOKENS +- OUTPUT_SPREAD tokens per request). No latency mode.
 #
 # MODE=cpu       CPU per token, client timing; nothing attached
 # MODE=profile   perf record on the frontend (or SGLang's server process) -> flame.svg
@@ -21,6 +23,7 @@ source "$(dirname "$0")/env.sh"
 : "${MEASURE_DIR:?}" "${ENGINE:?}" "${VARIANT:?}" "${MODE:?}" "${CONCURRENCY:?}" "${MODEL:?}" "${MODEL_PATH:?}"
 OUT=$MEASURE_DIR C=$CONCURRENCY WINDOW=${WINDOW:-20} OSL=${OUTPUT_TOKENS:-512} PROMPTS=${BENCH_PROMPTS:-$((2 * CONCURRENCY))}
 mkdir -p "$OUT"
+[ "$ENGINE" != mocker ] || [ "$MODE" != latency ] || { echo "the mock engine has no emit timestamps: no latency mode"; exit 1; }
 
 CLIENT_PID= TD= SAMPLER=
 cleanup() {   # leave nothing running, whatever happened
@@ -45,6 +48,9 @@ if [ "$MODE" = latency ]; then export DYN_BENCH_EMIT_TS=1 SARVAM_STEP_TRACE=1; f
 # Start what this window needs: a new worker when its settings change, else only a new frontend.
 if [ "$ENGINE" = sglang-direct ]; then
     worker_config="direct ${DYN_BENCH_EMIT_TS:-0} $SGLANG_ARGS" frontend_config=none
+elif [ "$ENGINE" = mocker ]; then
+    worker_config="mock ${WORKER_PYTHONPATH:-} ${MOCKER_CONFIG:?} $(sha256sum < "$MOCKER_CONFIG")"
+    frontend_config="${GATEWAY_PYTHONPATH:-} ${FRONTEND_ENV:-}"
 else
     worker_config="worker ${DYN_BENCH_EMIT_TS:-0} ${WORKER_PYTHONPATH:-} $SGLANG_ARGS ${SGLANG_WORKER_ARGS:-}"
     frontend_config="${GATEWAY_PYTHONPATH:-} ${FRONTEND_ENV:-}"
@@ -53,8 +59,12 @@ running=$RUN_DIR/running-config
 alive() { kill -0 "$(cat "$RUN_DIR/$1.pid" 2>/dev/null)" 2>/dev/null; }
 if [ "$(sed -n 1p "$running" 2>/dev/null)" != "$worker_config" ] || ! alive worker; then
     "$ROOT/scripts/serve.sh" stop > /dev/null
-    if [ "$ENGINE" = sglang-direct ]; then "$ROOT/scripts/serve.sh" direct; else "$ROOT/scripts/serve.sh" worker; fi > "$OUT/start.txt"
-elif [ "$ENGINE" = sglang ] && { [ "$(sed -n 2p "$running")" != "$frontend_config" ] || ! alive frontend; }; then
+    case $ENGINE in
+        sglang-direct) "$ROOT/scripts/serve.sh" direct ;;
+        mocker) "$ROOT/scripts/serve.sh" mock ;;
+        *) "$ROOT/scripts/serve.sh" worker ;;
+    esac > "$OUT/start.txt"
+elif [ "$ENGINE" != sglang-direct ] && { [ "$(sed -n 2p "$running")" != "$frontend_config" ] || ! alive frontend; }; then
     "$ROOT/scripts/serve.sh" stop frontend
     "$ROOT/scripts/serve.sh" frontend > "$OUT/start.txt"
 fi
@@ -90,14 +100,25 @@ inflight() { curl -s --max-time 2 "http://localhost:$HTTP_PORT/metrics" | metric
 tokens() { curl -s --max-time 2 "http://localhost:$HTTP_PORT/metrics" | metric "$TOK_METRIC"; }
 log_size() { stat -c %s "$RUN_DIR/worker.log"; }
 
-# The load: SGLang's benchmark client with the pinned prompt set, fixed output length.
 log_start=$(log_size)
-echo "$PROMPTS" > "$OUT/expected-prompts.txt"
-taskset -c "$CLIENT_CPUS" "$ROOT/.venv-sglang/bin/python" -m sglang.bench_serving \
-    --backend sglang-oai-chat --base-url "http://127.0.0.1:$HTTP_PORT" --model "$MODEL" --tokenizer "$MODEL_PATH" \
-    --dataset-name sharegpt --dataset-path "$SHAREGPT_DATASET" --seed 42 --max-concurrency "$C" --num-prompts "$PROMPTS" \
-    --warmup-requests "${CLIENT_WARMUP_REQUESTS:-16}" --sharegpt-output-len "$OSL" --sharegpt-context-len "$((OSL + 128))" \
-    --extra-request-body "$SG_BENCH_REQUEST_BODY" --output-details --output-file "$OUT/sglang-client.jsonl" > "$OUT/client.log" 2>&1 &
+client_started=$(date +%s)
+if [ "$ENGINE" = mocker ]; then
+    # The load: the Rust load generator holds C streams open for a fixed time; each request asks for
+    # OUTPUT_TOKENS +- OUTPUT_SPREAD tokens. It records every event's arrival after its 8 s warm-up.
+    LOADGEN=$ROOT/loadgen/target/release/loadgen
+    [ -x "$LOADGEN" ] || { echo "build the load generator first: ./setup.sh --mock"; exit 1; }
+    taskset -c "$CLIENT_CPUS" "$LOADGEN" --addr "127.0.0.1:$HTTP_PORT" --model "$MODEL" --concurrency "$C" \
+        --max-tokens "$OSL" --spread "${OUTPUT_SPREAD:-300}" --warmup 8 --ramp 2 --duration "$((WINDOW + 30))" \
+        --raw "$OUT/arrivals.csv" --out "$OUT/loadgen.json" > "$OUT/client.log" 2>&1 &
+else
+    # The load: SGLang's benchmark client with the pinned prompt set, fixed output length.
+    echo "$PROMPTS" > "$OUT/expected-prompts.txt"
+    taskset -c "$CLIENT_CPUS" "$ROOT/.venv-sglang/bin/python" -m sglang.bench_serving \
+        --backend sglang-oai-chat --base-url "http://127.0.0.1:$HTTP_PORT" --model "$MODEL" --tokenizer "$MODEL_PATH" \
+        --dataset-name sharegpt --dataset-path "$SHAREGPT_DATASET" --seed 42 --max-concurrency "$C" --num-prompts "$PROMPTS" \
+        --warmup-requests "${CLIENT_WARMUP_REQUESTS:-16}" --sharegpt-output-len "$OSL" --sharegpt-context-len "$((OSL + 128))" \
+        --extra-request-body "$SG_BENCH_REQUEST_BODY" --output-details --output-file "$OUT/sglang-client.jsonl" > "$OUT/client.log" 2>&1 &
+fi
 CLIENT_PID=$!
 need=$(((C * 98 + 99) / 100))
 for i in $(seq 180); do
@@ -120,6 +141,9 @@ if [ "${CHECKS:-1}" = 1 ]; then
     SAMPLER=$!
 fi
 sleep "${SETTLE_SECONDS:-3}"
+if [ "$ENGINE" = mocker ]; then      # the load generator records arrivals only after its 8 s warm-up
+    while [ $(( $(date +%s) - client_started )) -lt 9 ]; do sleep 0.2; done
+fi
 
 # Latency and syscalls windows capture the responses on loopback (a few seconds of margin on each side).
 if [ "$MODE" = latency ] || [ "$MODE" = syscalls ]; then
@@ -203,3 +227,4 @@ case $MODE in
 esac
 "$DYN_PY" "$ROOT/scripts/analyze.py" "$OUT" --concurrency "$C" --mode "$MODE" --engine "$ENGINE" --variant "$VARIANT" \
     --frontend-cpus "$FRONTEND_CPUS" --engine-cpus "$ENGINE_CPUS" --client-cpus "$CLIENT_CPUS" > /dev/null
+[ "$ENGINE" != mocker ] || zstd -q -f --rm "$OUT/arrivals.csv"      # every event's arrival time, kept compressed

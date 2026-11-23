@@ -1,11 +1,11 @@
 """Summarise one measurement window (a measure.sh output directory) into summary.json.
 
-  analyze.py DIR --concurrency N --mode MODE --engine sglang|sglang-direct --variant NAME
+  analyze.py DIR --concurrency N --mode MODE --engine sglang|sglang-direct|mocker --variant NAME
              --frontend-cpus LIST --engine-cpus LIST --client-cpus LIST
 
 CPU comes from the snapshots at the window edges: the frontend process (for SGLang's own server: its
-main process) and the worker's whole process group. Client timing comes from SGLang's benchmark client,
-cut to the window with clock.json. Flags mark a window whose numbers need care; they never drop it.
+main process) and the worker's whole process group. Client timing comes from SGLang's benchmark client
+(with the mock engine: the Rust load generator's arrival times), cut to the window with clock.json. Flags mark a window whose numbers need care; they never drop it.
 """
 import argparse
 import collections
@@ -90,39 +90,68 @@ s["cpu_busy_pct"], s["cpu_steal_pct"] = busy, steal
 # Client timing from SGLang's benchmark client, for the whole run and cut to the window. A gap belongs to
 # the window when the event that ends it arrives inside the window. clock.json converts the window's
 # realtime edges to the client's monotonic clock.
-client = json.loads((out / "sglang-client.jsonl").read_text().splitlines()[-1])
 offsets = load("clock.json")["realtime_minus_monotonic_ns"]
 offset = sum(offsets) / len(offsets)
-lo, hi = (a["t_ns"] - offset) / 1e9, (b["t_ns"] - offset) / 1e9
-gaps, ttfts, gaps_w, events_w, starts_w = [], [], [], 0, 0
-with open(out / "arrivals.jsonl", "w") as arrivals:     # every token's arrival time, per request
-    for request, (start, ttft, intervals, error) in enumerate(zip(
-            client["start_times"], client["ttfts"], client["itls"], client["errors"], strict=True)):
-        if error or ttft <= 0:
-            continue
-        times = [start + ttft]
-        ttfts.append(ttft * 1000)
-        for gap in intervals:
-            times.append(times[-1] + gap)
-            gaps.append(gap * 1000)
-        arrivals.write(json.dumps({"request": request, "monotonic_s": times}) + "\n")
-        starts_w += lo <= start < hi
-        for i, t in enumerate(times):
-            if lo <= t < hi:
-                events_w += 1
-                if i:
-                    gaps_w.append((t - times[i - 1]) * 1000)
-if not gaps or any(client["errors"]) or client["completed"] != len(client["errors"]):
-    raise SystemExit("the client did not complete the workload")
 levels = (("p50", 50), ("p99", 99), ("p99.9", 99.9))
-gaps.sort(); ttfts.sort(); gaps_w.sort()
-s["client"] = {
-    "requests": client["completed"], "errors_or_incomplete": 0,
-    "chunk_gap_ms": {k: pct(gaps, p) for k, p in levels},         # whole run, ramp-up and drain included
-    "ttft_ms": {k: pct(ttfts, p) for k, p in levels},
-    "window": {"content_events": events_w, "requests_started": starts_w,
-               "chunk_gap_ms": {k: pct(gaps_w, p) for k, p in levels} if gaps_w else None},
-}
+if args.engine == "mocker":
+    # The Rust load generator: one row per SSE event (connection, request, event number, monotonic ns),
+    # recorded after its warm-up. It runs for a fixed time, so requests are cut off at its end.
+    import csv
+    lo, hi = a["t_ns"] - offset, b["t_ns"] - offset
+    streams = collections.defaultdict(list)
+    with open(out / "arrivals.csv") as raw:
+        for row in csv.DictReader(raw):
+            streams[(row["conn"], row["request"])].append((int(row["event"]), int(row["t_mono_ns"])))
+    gaps_w, events_w = [], 0
+    for events in streams.values():
+        events.sort()
+        for (n0, t0), (n1, t1) in zip([(None, None)] + events, events):
+            if lo <= t1 < hi:
+                events_w += 1
+                if n0 is not None and n1 == n0 + 1:
+                    gaps_w.append((t1 - t0) / 1e6)
+    lg = load("loadgen.json")
+    if lg["requests_failed"] or not gaps_w:
+        raise SystemExit("the load generator had failed requests or recorded no events in the window")
+    gaps_w.sort()
+    s["client"] = {
+        "requests": lg["requests_completed"], "errors_or_incomplete": lg["requests_failed"],
+        "chunk_gap_ms": lg["chunk_gap_ms"], "ttft_ms": lg["ttft_ms"],      # after the warm-up, whole run
+        "window": {"content_events": events_w, "requests_started": None,
+                   "chunk_gap_ms": {k: pct(gaps_w, p) for k, p in levels}},
+    }
+    starts_w = 0
+else:
+    client = json.loads((out / "sglang-client.jsonl").read_text().splitlines()[-1])
+    lo, hi = (a["t_ns"] - offset) / 1e9, (b["t_ns"] - offset) / 1e9
+    gaps, ttfts, gaps_w, events_w, starts_w = [], [], [], 0, 0
+    with open(out / "arrivals.jsonl", "w") as arrivals:     # every token's arrival time, per request
+        for request, (start, ttft, intervals, error) in enumerate(zip(
+                client["start_times"], client["ttfts"], client["itls"], client["errors"], strict=True)):
+            if error or ttft <= 0:
+                continue
+            times = [start + ttft]
+            ttfts.append(ttft * 1000)
+            for gap in intervals:
+                times.append(times[-1] + gap)
+                gaps.append(gap * 1000)
+            arrivals.write(json.dumps({"request": request, "monotonic_s": times}) + "\n")
+            starts_w += lo <= start < hi
+            for i, t in enumerate(times):
+                if lo <= t < hi:
+                    events_w += 1
+                    if i:
+                        gaps_w.append((t - times[i - 1]) * 1000)
+    if not gaps or any(client["errors"]) or client["completed"] != len(client["errors"]):
+        raise SystemExit("the client did not complete the workload")
+    gaps.sort(); ttfts.sort(); gaps_w.sort()
+    s["client"] = {
+        "requests": client["completed"], "errors_or_incomplete": 0,
+        "chunk_gap_ms": {k: pct(gaps, p) for k, p in levels},         # whole run, ramp-up and drain included
+        "ttft_ms": {k: pct(ttfts, p) for k, p in levels},
+        "window": {"content_events": events_w, "requests_started": starts_w,
+                   "chunk_gap_ms": {k: pct(gaps_w, p) for k, p in levels} if gaps_w else None},
+    }
 s["content_events_in_window"] = events_w
 
 if args.mode == "latency":

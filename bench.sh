@@ -7,21 +7,30 @@
 #   ./bench.sh --rounds 3           three CPU rounds per arm and level, reported as the median (all levels: about 2 h 30 min)
 #   ./bench.sh --levels "512 2048"  other levels (2048 is required; 4096 is allowed)
 #   ./bench.sh --resume DIR         continue a stopped run
+#   ./bench.sh --mock ...           Dynamo's mock engine instead of SGLang, no GPU (needs ./setup.sh --mock);
+#                                   stock and optimized arms only, no latency windows
 #
 # Needs ./setup.sh and benchmark mode (sudo ./bench-mode.sh on). Results: results/bench-<time>/table.md
 set -euo pipefail
 cd "$(dirname "$0")"
-levels="256 512 1024 2048" rounds=1 out=
+levels="256 512 1024 2048" rounds=1 out= mock=0
 while (( $# )); do
     case $1 in
         --quick) levels=2048; shift ;;
         --levels) levels=$2; shift 2 ;;
         --rounds) rounds=$2; shift 2 ;;
         --resume) out=$(realpath "$2"); shift 2 ;;
-        *) sed -n '2,11p' "$0"; exit 1 ;;
+        --mock) mock=1; shift ;;
+        *) sed -n '2,13p' "$0"; exit 1 ;;
     esac
 done
-source config/model.env
+if [[ $mock == 1 ]]; then
+    source config/mock.env
+    export MOCK=1 MOCKER_CONFIG OUTPUT_TOKENS OUTPUT_SPREAD OPTIMIZED_WORKER_THREADS
+    [[ -x loadgen/target/release/loadgen ]] || { echo "The load generator is not built: ./setup.sh --mock" >&2; exit 1; }
+else
+    source config/model.env
+fi
 export BUILD_DIR=$(realpath -m "${BUILD_DIR:-build}") MODEL MODEL_PATH SGLANG_ARGS SGLANG_WORKER_ARGS
 export PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH
 [[ -d /run/sarvam-bench-state ]] || { echo "Benchmark mode is off: sudo ./bench-mode.sh on" >&2; exit 1; }

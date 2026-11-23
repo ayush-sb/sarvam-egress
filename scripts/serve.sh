@@ -4,9 +4,11 @@
 #   scripts/serve.sh worker           Dynamo's SGLang worker (native library: WORKER_PYTHONPATH) and a frontend
 #   scripts/serve.sh frontend         only a new frontend (GATEWAY_PYTHONPATH, FRONTEND_ENV), same worker
 #   scripts/serve.sh direct           SGLang's own HTTP server, no gateway, on the frontend + worker cores
+#   scripts/serve.sh mock             Dynamo's mock engine (Rust, no GPU; MOCKER_CONFIG) and a frontend
 #   scripts/serve.sh stop [frontend]  stop everything, or only the frontend
 #
 # Needs MODEL, MODEL_PATH and SGLANG_ARGS (SGLANG_WORKER_ARGS: options for Dynamo's worker only).
+# The mock engine needs MODEL, MODEL_PATH (the tokenizer files) and MOCKER_CONFIG.
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 sglang=$ROOT/.venv-sglang
@@ -51,6 +53,14 @@ case ${1:-} in
         echo $! > "$RUN_DIR/worker.pid"
         start_frontend
         wait_ready 1200 worker frontend ;;      # the first start loads the model and compiles kernels
+    mock)
+        port_free; rm -rf "$DYN_FILE_KV"
+        setsid taskset -c "$WORKER_CPUS" env "PYTHONPATH=${WORKER_PYTHONPATH:-}" "$DYN_PY" -m dynamo.mocker \
+            --model-path "$MODEL_PATH" --model-name "$MODEL" --extra-engine-args "${MOCKER_CONFIG:?}" \
+            > "$RUN_DIR/worker.log" 2>&1 &
+        echo $! > "$RUN_DIR/worker.pid"
+        start_frontend
+        wait_ready 120 worker frontend ;;
     frontend)
         port_free; start_frontend
         wait_ready 120 worker frontend ;;
@@ -63,5 +73,5 @@ case ${1:-} in
         wait_ready 1200 worker ;;
     stop)
         if [ "${2:-}" = frontend ]; then stop frontend; else stop frontend worker; rm -rf "$DYN_FILE_KV"; fi ;;
-    *) sed -n '2,9p' "$0"; exit 1 ;;
+    *) sed -n '2,11p' "$0"; exit 1 ;;
 esac
